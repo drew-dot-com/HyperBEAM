@@ -75,6 +75,7 @@ start(Opts) ->
         os_mon
     ]),
     hb:init(),
+    hb_sched_loc:init(),
     BaseOpts = set_default_opts(Opts),
     {ok, Listener, _Port} = new_server(BaseOpts),
     {ok, Listener}.
@@ -568,6 +569,7 @@ start_node(Opts) ->
         os_mon
     ]),
     hb:init(),
+    hb_sched_loc:init(),
     hb_sup:start_link(Opts),
     ServerOpts = set_default_opts(Opts),
     {ok, _Listener, Port} = new_server(ServerOpts),

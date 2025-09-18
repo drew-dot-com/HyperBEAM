@@ -383,7 +383,10 @@ get_location(_Msg1, Req, Opts) ->
             Opts
         ),
     % Search for the location of the scheduler in the scheduler-location cache.
-    case dev_scheduler_cache:read_location(Address, Opts) of
+    case hb_sched_loc:get(Address) of
+        {Url, Exp} -> {ok, #{ <<"address">> => Address, <<"url">> => Url, <<"expires_at">> => Exp }};
+        undefined ->
+            case dev_scheduler_cache:read_location(Address, Opts) of
         not_found ->
             {ok,
                 #{
@@ -434,6 +437,20 @@ post_location(Msg1, RawReq, RawOpts) ->
             {error, _} -> -1
         end,
     NewNonce = hb_ao:get(<<"nonce">>, OnlyCommitted, ExistingNonce + 1, Opts),
+    %% HB ETS fast path for operator-signed direct mapping (address/url/ttl_ms)
+    Url0 = hb_ao:get(<<"url">>, OnlyCommitted, not_found, Opts),
+    case {Url0 =:= not_found, lists:member(Self, Signers)} of
+        {false, true} ->
+            TTL = hb_ao:get(<<"ttl_ms">>, OnlyCommitted, hb_opts:get(scheduler_location_ttl, 1000*60*60, Opts), Opts),
+            Addr0 = hb_ao:get(<<"address">>, OnlyCommitted, Self, Opts),
+            Exp0 = erlang:system_time(millisecond) + TTL,
+            ok = hb_sched_loc:put(Addr0, Url0, Exp0),
+            {ok, #{ <<"address">> => Addr0, <<"url">> => Url0, <<"ttl_ms">> => TTL, <<"expires_at">> => Exp0 }};
+        _ ->
+            %% fall through to existing nonce/registry behavior
+            nop
+    end,
+
     case {NewNonce > ExistingNonce, lists:member(Self, Signers)} of
         {false, _} ->
             % Invalid request: Known nonce is already higher than requested nonce
