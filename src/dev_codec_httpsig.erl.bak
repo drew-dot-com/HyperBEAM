@@ -65,18 +65,7 @@ verify(Base, Req, RawOpts) ->
     {ok, EncMsg, EncComm, _} = normalize_for_encoding(Base, Req, Opts),
     SigBase = signature_base(EncMsg, EncComm, Opts),
     KeyRes = dev_codec_httpsig_keyid:req_to_key_material(Req, Opts),
-    SigHeader = maps:get(<<"signature">>, Req),
-    SigInputHdr = maps:get(<<"signature-input">>, Req, <<>>),
-    SigLabel = case re:run(SigInputHdr, <<"^\s*([A-Za-z0-9_-]+)\s*=">>, [{capture,[1],binary}]) of
-        {match, [L]} -> L; _ -> <<"sig1">>
-    end,
-    PatL = iolist_to_binary([<<"\s*">>, SigLabel, <<"\s*=\s*:(.+):\s*">>]),
-    SigB64 = case re:run(SigHeader, PatL, [{capture,[1],binary}]) of
-        {match, [B64]} -> B64;
-        nomatch -> case re:run(SigHeader, <<"^\s*:(.+):\s*$">>, [{capture,[1],binary}]) of
-            {match, [B642]} -> B642; _ -> SigHeader end
-    end,
-    RawSignature = hb_util:decode(Signature = SigB64),
+    RawSignature = hb_util:decode(Signature = maps:get(<<"signature">>, Req)),
     ?event(debug_httpsig,
         {
             httpsig_verifying,

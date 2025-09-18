@@ -58,13 +58,7 @@ commitment_to_sf_siginfo(Msg, Commitment, Opts) ->
     % `keyid' in the `signature-input' keys.
     KeyID = maps:get(<<"keyid">>, Commitment, <<>>),
     % Extract the signature from the commitment.
-    SigHeader__ = maps:get(<<"signature">>, Commitment),
-    SigVal__ = case re:run(SigHeader__, <<"^\s*[A-Za-z0-9_-]+\s*=\s*:(.+):\s*$">>, [{capture,[1],binary}]) of
-        {match, [B64]} -> B64;
-        nomatch -> case re:run(SigHeader__, <<"^\s*:(.+):\s*$">>, [{capture,[1],binary}]) of
-            {match, [B642]} -> B642; _ -> SigHeader__ end
-    end,
-    Signature = hb_util:decode(SigVal__),
+    Signature = hb_util:decode(maps:get(<<"signature">>, Commitment)),
     % Extract the keys present in the commitment.
     CommittedKeys = to_siginfo_keys(Msg, Commitment, Opts),
     ?event({normalized_for_enc, CommittedKeys, {commitment, Commitment}}),

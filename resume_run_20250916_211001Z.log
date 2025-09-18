@@ -1,0 +1,7 @@
+[start] 2025-09-16T21:10:01+00:00
+               total        used        free      shared  buff/cache   available
+Mem:            15Gi       377Mi        14Gi       2.0Mi       796Mi        14Gi
+Swap:          6.0Gi          0B       6.0Gi
+===> Verifying dependencies...
+Command terminated by signal 9
+[time compile] 8:20.29 15666368KB

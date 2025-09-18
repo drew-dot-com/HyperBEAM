@@ -72,34 +72,7 @@ from(HTTP, _Req, Opts) ->
         case ?IS_EMPTY_MESSAGE(Commitments) of
             false -> MsgWithoutSigs#{ <<"commitments">> => Commitments };
             true -> MsgWithoutSigs
-        CommitmentsMap = case maps:get(<<"commitments">>, Msg, undefined) of
-        undefined ->
-            case maps:get(<<"signature">>, Msg, undefined) of
-                undefined -> #{};
-                SignatureHdr ->
-                    MaybeBundleTag = maps:with([<<"bundle">>], Msg),
-                    SigInputHdr = maps:get(<<"signature-input">>, Msg, <<>>),
-                    SigLabel = case re:run(SigInputHdr, <<"^\s*([A-Za-z0-9_-]+)\s*=">>, [{capture,[1],binary}]) of
-                        {match, [L]} -> L; _ -> <<"sig1">>
-                    end,
-                    PatL = iolist_to_binary([<<"\s*">>, SigLabel, <<"\s*=\s*:(.+):\s*">>]),
-                    SigB64 = case re:run(SignatureHdr, PatL, [{capture,[1],binary}]) of
-                        {match, [B64]} -> B64;
-                        nomatch -> case re:run(SignatureHdr, <<"^\s*:(.+):\s*$">>, [{capture,[1],binary}]) of
-                            {match, [B642]} -> B642; _ -> SignatureHdr end
-                    end,
-                    #{
-                        SignatureHdr => MaybeBundleTag#{
-                            <<"signature">> => SigB64,
-                            <<"committed">> => maps:get(<<"committed">>, Msg, #{}),
-                            <<"keyid">> => maps:get(<<"keyid">>, Msg, <<>>),
-                            <<"commitment-device">> => <<"httpsig@1.0">>,
-                            <<"type">> => maps:get(<<"type">>, Msg, <<>>)}
-                    }
-            end;
-        Commitments ->
-            Commitments
-    end,
+        end,
     ?event({message_with_commitments, MsgWithSigs}),
     Res =
         hb_maps:without(
@@ -113,34 +86,7 @@ from(HTTP, _Req, Opts) ->
                 case hb_message:is_signed_key(<<"ao-body-key">>, MsgWithSigs, Opts) of
                     true -> [];
                     false -> [<<"ao-body-key">>]
-                CommitmentsMap = case maps:get(<<"commitments">>, Msg, undefined) of
-        undefined ->
-            case maps:get(<<"signature">>, Msg, undefined) of
-                undefined -> #{};
-                SignatureHdr ->
-                    MaybeBundleTag = maps:with([<<"bundle">>], Msg),
-                    SigInputHdr = maps:get(<<"signature-input">>, Msg, <<>>),
-                    SigLabel = case re:run(SigInputHdr, <<"^\s*([A-Za-z0-9_-]+)\s*=">>, [{capture,[1],binary}]) of
-                        {match, [L]} -> L; _ -> <<"sig1">>
-                    end,
-                    PatL = iolist_to_binary([<<"\s*">>, SigLabel, <<"\s*=\s*:(.+):\s*">>]),
-                    SigB64 = case re:run(SignatureHdr, PatL, [{capture,[1],binary}]) of
-                        {match, [B64]} -> B64;
-                        nomatch -> case re:run(SignatureHdr, <<"^\s*:(.+):\s*$">>, [{capture,[1],binary}]) of
-                            {match, [B642]} -> B642; _ -> SignatureHdr end
-                    end,
-                    #{
-                        SignatureHdr => MaybeBundleTag#{
-                            <<"signature">> => SigB64,
-                            <<"committed">> => maps:get(<<"committed">>, Msg, #{}),
-                            <<"keyid">> => maps:get(<<"keyid">>, Msg, <<>>),
-                            <<"commitment-device">> => <<"httpsig@1.0">>,
-                            <<"type">> => maps:get(<<"type">>, Msg, <<>>)}
-                    }
-            end;
-        Commitments ->
-            Commitments
-    end,
+                end,
             MsgWithSigs,
             Opts
         ),
@@ -168,34 +114,7 @@ body_to_tabm(HTTP, Opts) ->
                     lists:map(
                         fun(Part) ->
                             from_body_part(InlinedKey, Part, Opts)
-                        CommitmentsMap = case maps:get(<<"commitments">>, Msg, undefined) of
-        undefined ->
-            case maps:get(<<"signature">>, Msg, undefined) of
-                undefined -> #{};
-                SignatureHdr ->
-                    MaybeBundleTag = maps:with([<<"bundle">>], Msg),
-                    SigInputHdr = maps:get(<<"signature-input">>, Msg, <<>>),
-                    SigLabel = case re:run(SigInputHdr, <<"^\s*([A-Za-z0-9_-]+)\s*=">>, [{capture,[1],binary}]) of
-                        {match, [L]} -> L; _ -> <<"sig1">>
-                    end,
-                    PatL = iolist_to_binary([<<"\s*">>, SigLabel, <<"\s*=\s*:(.+):\s*">>]),
-                    SigB64 = case re:run(SignatureHdr, PatL, [{capture,[1],binary}]) of
-                        {match, [B64]} -> B64;
-                        nomatch -> case re:run(SignatureHdr, <<"^\s*:(.+):\s*$">>, [{capture,[1],binary}]) of
-                            {match, [B642]} -> B642; _ -> SignatureHdr end
-                    end,
-                    #{
-                        SignatureHdr => MaybeBundleTag#{
-                            <<"signature">> => SigB64,
-                            <<"committed">> => maps:get(<<"committed">>, Msg, #{}),
-                            <<"keyid">> => maps:get(<<"keyid">>, Msg, <<>>),
-                            <<"commitment-device">> => <<"httpsig@1.0">>,
-                            <<"type">> => maps:get(<<"type">>, Msg, <<>>)}
-                    }
-            end;
-        Commitments ->
-            Commitments
-    end,
+                        end,
                         Parts
                     ),
                 % Merge all of the parts into a single TABM.
@@ -217,67 +136,13 @@ body_to_tabm(HTTP, Opts) ->
                         lists:map(
                             fun(Path) ->
                                 hd(binary:split(Path, <<"/">>, [global]))
-                            CommitmentsMap = case maps:get(<<"commitments">>, Msg, undefined) of
-        undefined ->
-            case maps:get(<<"signature">>, Msg, undefined) of
-                undefined -> #{};
-                SignatureHdr ->
-                    MaybeBundleTag = maps:with([<<"bundle">>], Msg),
-                    SigInputHdr = maps:get(<<"signature-input">>, Msg, <<>>),
-                    SigLabel = case re:run(SigInputHdr, <<"^\s*([A-Za-z0-9_-]+)\s*=">>, [{capture,[1],binary}]) of
-                        {match, [L]} -> L; _ -> <<"sig1">>
-                    end,
-                    PatL = iolist_to_binary([<<"\s*">>, SigLabel, <<"\s*=\s*:(.+):\s*">>]),
-                    SigB64 = case re:run(SignatureHdr, PatL, [{capture,[1],binary}]) of
-                        {match, [B64]} -> B64;
-                        nomatch -> case re:run(SignatureHdr, <<"^\s*:(.+):\s*$">>, [{capture,[1],binary}]) of
-                            {match, [B642]} -> B642; _ -> SignatureHdr end
-                    end,
-                    #{
-                        SignatureHdr => MaybeBundleTag#{
-                            <<"signature">> => SigB64,
-                            <<"committed">> => maps:get(<<"committed">>, Msg, #{}),
-                            <<"keyid">> => maps:get(<<"keyid">>, Msg, <<>>),
-                            <<"commitment-device">> => <<"httpsig@1.0">>,
-                            <<"type">> => maps:get(<<"type">>, Msg, <<>>)}
-                    }
-            end;
-        Commitments ->
-            Commitments
-    end,
+                            end,
                             MessagePaths
                         )
                     ),
                 % Return both as a pair.
                 {Keys, MergedParts}
-        CommitmentsMap = case maps:get(<<"commitments">>, Msg, undefined) of
-        undefined ->
-            case maps:get(<<"signature">>, Msg, undefined) of
-                undefined -> #{};
-                SignatureHdr ->
-                    MaybeBundleTag = maps:with([<<"bundle">>], Msg),
-                    SigInputHdr = maps:get(<<"signature-input">>, Msg, <<>>),
-                    SigLabel = case re:run(SigInputHdr, <<"^\s*([A-Za-z0-9_-]+)\s*=">>, [{capture,[1],binary}]) of
-                        {match, [L]} -> L; _ -> <<"sig1">>
-                    end,
-                    PatL = iolist_to_binary([<<"\s*">>, SigLabel, <<"\s*=\s*:(.+):\s*">>]),
-                    SigB64 = case re:run(SignatureHdr, PatL, [{capture,[1],binary}]) of
-                        {match, [B64]} -> B64;
-                        nomatch -> case re:run(SignatureHdr, <<"^\s*:(.+):\s*$">>, [{capture,[1],binary}]) of
-                            {match, [B642]} -> B642; _ -> SignatureHdr end
-                    end,
-                    #{
-                        SignatureHdr => MaybeBundleTag#{
-                            <<"signature">> => SigB64,
-                            <<"committed">> => maps:get(<<"committed">>, Msg, #{}),
-                            <<"keyid">> => maps:get(<<"keyid">>, Msg, <<>>),
-                            <<"commitment-device">> => <<"httpsig@1.0">>,
-                            <<"type">> => maps:get(<<"type">>, Msg, <<>>)}
-                    }
-            end;
-        Commitments ->
-            Commitments
-    end,
+        end,
     {OrderedBodyKeys, BodyTABM}.
 
 %% @doc Split the body into parts, if it is a multipart.
@@ -296,34 +161,7 @@ body_to_parts(ContentType, Body, _Opts) ->
                 {item, {_, _XT}, XParams} =
                     hb_structured_fields:parse_item(ContentType),
                 XParams
-        CommitmentsMap = case maps:get(<<"commitments">>, Msg, undefined) of
-        undefined ->
-            case maps:get(<<"signature">>, Msg, undefined) of
-                undefined -> #{};
-                SignatureHdr ->
-                    MaybeBundleTag = maps:with([<<"bundle">>], Msg),
-                    SigInputHdr = maps:get(<<"signature-input">>, Msg, <<>>),
-                    SigLabel = case re:run(SigInputHdr, <<"^\s*([A-Za-z0-9_-]+)\s*=">>, [{capture,[1],binary}]) of
-                        {match, [L]} -> L; _ -> <<"sig1">>
-                    end,
-                    PatL = iolist_to_binary([<<"\s*">>, SigLabel, <<"\s*=\s*:(.+):\s*">>]),
-                    SigB64 = case re:run(SignatureHdr, PatL, [{capture,[1],binary}]) of
-                        {match, [B64]} -> B64;
-                        nomatch -> case re:run(SignatureHdr, <<"^\s*:(.+):\s*$">>, [{capture,[1],binary}]) of
-                            {match, [B642]} -> B642; _ -> SignatureHdr end
-                    end,
-                    #{
-                        SignatureHdr => MaybeBundleTag#{
-                            <<"signature">> => SigB64,
-                            <<"committed">> => maps:get(<<"committed">>, Msg, #{}),
-                            <<"keyid">> => maps:get(<<"keyid">>, Msg, <<>>),
-                            <<"commitment-device">> => <<"httpsig@1.0">>,
-                            <<"type">> => maps:get(<<"type">>, Msg, <<>>)}
-                    }
-            end;
-        Commitments ->
-            Commitments
-    end,
+        end,
     case lists:keyfind(<<"boundary">>, 1, Params) of
         false ->
             % The body is not a multipart, so just set as is to the Inlined key on
@@ -368,34 +206,7 @@ from_body_part(InlinedKey, Part, Opts) ->
                 {XRawHeadersBlock, <<>>};
             [XRawHeadersBlock, XRawBody] ->
                 {XRawHeadersBlock, XRawBody}
-        CommitmentsMap = case maps:get(<<"commitments">>, Msg, undefined) of
-        undefined ->
-            case maps:get(<<"signature">>, Msg, undefined) of
-                undefined -> #{};
-                SignatureHdr ->
-                    MaybeBundleTag = maps:with([<<"bundle">>], Msg),
-                    SigInputHdr = maps:get(<<"signature-input">>, Msg, <<>>),
-                    SigLabel = case re:run(SigInputHdr, <<"^\s*([A-Za-z0-9_-]+)\s*=">>, [{capture,[1],binary}]) of
-                        {match, [L]} -> L; _ -> <<"sig1">>
-                    end,
-                    PatL = iolist_to_binary([<<"\s*">>, SigLabel, <<"\s*=\s*:(.+):\s*">>]),
-                    SigB64 = case re:run(SignatureHdr, PatL, [{capture,[1],binary}]) of
-                        {match, [B64]} -> B64;
-                        nomatch -> case re:run(SignatureHdr, <<"^\s*:(.+):\s*$">>, [{capture,[1],binary}]) of
-                            {match, [B642]} -> B642; _ -> SignatureHdr end
-                    end,
-                    #{
-                        SignatureHdr => MaybeBundleTag#{
-                            <<"signature">> => SigB64,
-                            <<"committed">> => maps:get(<<"committed">>, Msg, #{}),
-                            <<"keyid">> => maps:get(<<"keyid">>, Msg, <<>>),
-                            <<"commitment-device">> => <<"httpsig@1.0">>,
-                            <<"type">> => maps:get(<<"type">>, Msg, <<>>)}
-                    }
-            end;
-        Commitments ->
-            Commitments
-    end,
+        end,
     % Extract individual headers
     RawHeaders = binary:split(RawHeadersBlock, ?CRLF, [global]),
     % Now we parse each header, splitting into {Key, Value}
@@ -409,34 +220,7 @@ from_body_part(InlinedKey, Part, Opts) ->
                             % skip lines that aren't properly formatted headers
                             false
                     end
-            CommitmentsMap = case maps:get(<<"commitments">>, Msg, undefined) of
-        undefined ->
-            case maps:get(<<"signature">>, Msg, undefined) of
-                undefined -> #{};
-                SignatureHdr ->
-                    MaybeBundleTag = maps:with([<<"bundle">>], Msg),
-                    SigInputHdr = maps:get(<<"signature-input">>, Msg, <<>>),
-                    SigLabel = case re:run(SigInputHdr, <<"^\s*([A-Za-z0-9_-]+)\s*=">>, [{capture,[1],binary}]) of
-                        {match, [L]} -> L; _ -> <<"sig1">>
-                    end,
-                    PatL = iolist_to_binary([<<"\s*">>, SigLabel, <<"\s*=\s*:(.+):\s*">>]),
-                    SigB64 = case re:run(SignatureHdr, PatL, [{capture,[1],binary}]) of
-                        {match, [B64]} -> B64;
-                        nomatch -> case re:run(SignatureHdr, <<"^\s*:(.+):\s*$">>, [{capture,[1],binary}]) of
-                            {match, [B642]} -> B642; _ -> SignatureHdr end
-                    end,
-                    #{
-                        SignatureHdr => MaybeBundleTag#{
-                            <<"signature">> => SigB64,
-                            <<"committed">> => maps:get(<<"committed">>, Msg, #{}),
-                            <<"keyid">> => maps:get(<<"keyid">>, Msg, <<>>),
-                            <<"commitment-device">> => <<"httpsig@1.0">>,
-                            <<"type">> => maps:get(<<"type">>, Msg, <<>>)}
-                    }
-            end;
-        Commitments ->
-            Commitments
-    end,
+            end,
             RawHeaders
         )),
     % The Content-Disposition is from the parent message,
@@ -461,34 +245,7 @@ from_body_part(InlinedKey, Part, Opts) ->
                             {_, {_type, PN}} -> {ok, PN};
                             false -> no_part_name_found
                         end
-                CommitmentsMap = case maps:get(<<"commitments">>, Msg, undefined) of
-        undefined ->
-            case maps:get(<<"signature">>, Msg, undefined) of
-                undefined -> #{};
-                SignatureHdr ->
-                    MaybeBundleTag = maps:with([<<"bundle">>], Msg),
-                    SigInputHdr = maps:get(<<"signature-input">>, Msg, <<>>),
-                    SigLabel = case re:run(SigInputHdr, <<"^\s*([A-Za-z0-9_-]+)\s*=">>, [{capture,[1],binary}]) of
-                        {match, [L]} -> L; _ -> <<"sig1">>
-                    end,
-                    PatL = iolist_to_binary([<<"\s*">>, SigLabel, <<"\s*=\s*:(.+):\s*">>]),
-                    SigB64 = case re:run(SignatureHdr, PatL, [{capture,[1],binary}]) of
-                        {match, [B64]} -> B64;
-                        nomatch -> case re:run(SignatureHdr, <<"^\s*:(.+):\s*$">>, [{capture,[1],binary}]) of
-                            {match, [B642]} -> B642; _ -> SignatureHdr end
-                    end,
-                    #{
-                        SignatureHdr => MaybeBundleTag#{
-                            <<"signature">> => SigB64,
-                            <<"committed">> => maps:get(<<"committed">>, Msg, #{}),
-                            <<"keyid">> => maps:get(<<"keyid">>, Msg, <<>>),
-                            <<"commitment-device">> => <<"httpsig@1.0">>,
-                            <<"type">> => maps:get(<<"type">>, Msg, <<>>)}
-                    }
-            end;
-        Commitments ->
-            Commitments
-    end,
+                end,
             Commitments =
                 dev_codec_httpsig_siginfo:siginfo_to_commitments(
                     Headers#{ PartName => RawBody },
@@ -539,34 +296,7 @@ from_body_part(InlinedKey, Part, Opts) ->
                                 RestHeaders#{ RawBodyKey => RawBody }
                         end;
                     _ -> maps:get(NestedPartName, Commitments, #{})
-                CommitmentsMap = case maps:get(<<"commitments">>, Msg, undefined) of
-        undefined ->
-            case maps:get(<<"signature">>, Msg, undefined) of
-                undefined -> #{};
-                SignatureHdr ->
-                    MaybeBundleTag = maps:with([<<"bundle">>], Msg),
-                    SigInputHdr = maps:get(<<"signature-input">>, Msg, <<>>),
-                    SigLabel = case re:run(SigInputHdr, <<"^\s*([A-Za-z0-9_-]+)\s*=">>, [{capture,[1],binary}]) of
-                        {match, [L]} -> L; _ -> <<"sig1">>
-                    end,
-                    PatL = iolist_to_binary([<<"\s*">>, SigLabel, <<"\s*=\s*:(.+):\s*">>]),
-                    SigB64 = case re:run(SignatureHdr, PatL, [{capture,[1],binary}]) of
-                        {match, [B64]} -> B64;
-                        nomatch -> case re:run(SignatureHdr, <<"^\s*:(.+):\s*$">>, [{capture,[1],binary}]) of
-                            {match, [B642]} -> B642; _ -> SignatureHdr end
-                    end,
-                    #{
-                        SignatureHdr => MaybeBundleTag#{
-                            <<"signature">> => SigB64,
-                            <<"committed">> => maps:get(<<"committed">>, Msg, #{}),
-                            <<"keyid">> => maps:get(<<"keyid">>, Msg, <<>>),
-                            <<"commitment-device">> => <<"httpsig@1.0">>,
-                            <<"type">> => maps:get(<<"type">>, Msg, <<>>)}
-                    }
-            end;
-        Commitments ->
-            Commitments
-    end,
+                end,
             {PartName, ParsedPart}
     end.
 
@@ -657,34 +387,7 @@ to(TABM, Req, FormatOpts, Opts) when is_map(TABM) ->
                     },
                     Opts
                 )
-        CommitmentsMap = case maps:get(<<"commitments">>, Msg, undefined) of
-        undefined ->
-            case maps:get(<<"signature">>, Msg, undefined) of
-                undefined -> #{};
-                SignatureHdr ->
-                    MaybeBundleTag = maps:with([<<"bundle">>], Msg),
-                    SigInputHdr = maps:get(<<"signature-input">>, Msg, <<>>),
-                    SigLabel = case re:run(SigInputHdr, <<"^\s*([A-Za-z0-9_-]+)\s*=">>, [{capture,[1],binary}]) of
-                        {match, [L]} -> L; _ -> <<"sig1">>
-                    end,
-                    PatL = iolist_to_binary([<<"\s*">>, SigLabel, <<"\s*=\s*:(.+):\s*">>]),
-                    SigB64 = case re:run(SignatureHdr, PatL, [{capture,[1],binary}]) of
-                        {match, [B64]} -> B64;
-                        nomatch -> case re:run(SignatureHdr, <<"^\s*:(.+):\s*$">>, [{capture,[1],binary}]) of
-                            {match, [B642]} -> B642; _ -> SignatureHdr end
-                    end,
-                    #{
-                        SignatureHdr => MaybeBundleTag#{
-                            <<"signature">> => SigB64,
-                            <<"committed">> => maps:get(<<"committed">>, Msg, #{}),
-                            <<"keyid">> => maps:get(<<"keyid">>, Msg, <<>>),
-                            <<"commitment-device">> => <<"httpsig@1.0">>,
-                            <<"type">> => maps:get(<<"type">>, Msg, <<>>)}
-                    }
-            end;
-        Commitments ->
-            Commitments
-    end,
+        end,
     % Group the IDs into a dictionary, so that they can be distributed as
     % HTTP headers. If we did not do this, ID keys would be lower-cased and
     % their comparability against the original keys would be lost.
@@ -724,33 +427,6 @@ to(TABM, Req, FormatOpts, Opts) when is_map(TABM) ->
                             <<"commitment-device">> => <<"httpsig@1.0">>,
                             <<"type">> => maps:get(<<"type">>, Msg, <<>>)
                         }
-                    }
-            end;
-        Commitments ->
-            Commitments
-    CommitmentsMap = case maps:get(<<"commitments">>, Msg, undefined) of
-        undefined ->
-            case maps:get(<<"signature">>, Msg, undefined) of
-                undefined -> #{};
-                SignatureHdr ->
-                    MaybeBundleTag = maps:with([<<"bundle">>], Msg),
-                    SigInputHdr = maps:get(<<"signature-input">>, Msg, <<>>),
-                    SigLabel = case re:run(SigInputHdr, <<"^\s*([A-Za-z0-9_-]+)\s*=">>, [{capture,[1],binary}]) of
-                        {match, [L]} -> L; _ -> <<"sig1">>
-                    end,
-                    PatL = iolist_to_binary([<<"\s*">>, SigLabel, <<"\s*=\s*:(.+):\s*">>]),
-                    SigB64 = case re:run(SignatureHdr, PatL, [{capture,[1],binary}]) of
-                        {match, [B64]} -> B64;
-                        nomatch -> case re:run(SignatureHdr, <<"^\s*:(.+):\s*$">>, [{capture,[1],binary}]) of
-                            {match, [B642]} -> B642; _ -> SignatureHdr end
-                    end,
-                    #{
-                        SignatureHdr => MaybeBundleTag#{
-                            <<"signature">> => SigB64,
-                            <<"committed">> => maps:get(<<"committed">>, Msg, #{}),
-                            <<"keyid">> => maps:get(<<"keyid">>, Msg, <<>>),
-                            <<"commitment-device">> => <<"httpsig@1.0">>,
-                            <<"type">> => maps:get(<<"type">>, Msg, <<>>)}
                     }
             end;
         Commitments ->

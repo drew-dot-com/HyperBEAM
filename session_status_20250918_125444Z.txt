@@ -1,0 +1,33 @@
+TIME: Thu Sep 18 12:54:44 UTC 2025
+● hyperbeam.service - HyperBEAM AO Node
+     Loaded: loaded (/etc/systemd/system/hyperbeam.service; enabled; vendor preset: enabled)
+    Drop-In: /etc/systemd/system/hyperbeam.service.d
+             └─override.conf
+     Active: active (running) since Wed 2025-09-17 20:20:46 UTC; 16h ago
+   Main PID: 360735 (beam.smp)
+      Tasks: 31 (limit: 18921)
+     Memory: 190.8M
+        CPU: 2h 28min 5.285s
+     CGroup: /system.slice/hyperbeam.service
+             ├─360735 /home/ubuntu/HyperBEAM/_build/default/rel/hb/bin/hb -Bd -C multi_time_warp -- -root /home/ubuntu/HyperBEAM/_build/default/rel/hb -bindir /home/ubuntu/HyperBEAM/_build/default/rel/hb/erts-15.0/bin -progname home/ubuntu/HyperBEAM/_build/default/rel/hb/bin/hb -- -- -noshell -noinput -boot /home/ubuntu/HyperBEAM/_build/default/rel/hb/releases/0.0.1/start -mode embedded -boot_var SYSTEM_LIB_DIR /home/ubuntu/HyperBEAM/_build/default/rel/hb/lib -config /home/ubuntu/HyperBEAM/_build/default/rel/hb/releases/0.0.1/sys.config -sname hb -setcookie hb -- -- foreground --
+             ├─360807 /home/ubuntu/HyperBEAM/_build/default/rel/hb/erts-15.0/bin/epmd -daemon
+             ├─360892 erl_child_setup 1024
+             ├─360919 sh -s disksup
+             ├─360920 /home/ubuntu/HyperBEAM/_build/default/rel/hb/lib/os_mon-2.10/priv/bin/memsup
+             ├─360923 /home/ubuntu/HyperBEAM/_build/default/rel/hb/lib/os_mon-2.10/priv/bin/cpu_sup
+             ├─360968 /home/ubuntu/HyperBEAM/_build/default/rel/hb/erts-15.0/bin/inet_gethost 4
+             └─360969 /home/ubuntu/HyperBEAM/_build/default/rel/hb/erts-15.0/bin/inet_gethost 4
+
+Sep 18 12:54:05 ip-172-31-41-232 hb[360735]:     cowboy_handler:execute/2 [/home/ubuntu/HyperBEAM/_build/default/lib/cowboy/src/cowboy_handler.erl:37]
+Sep 18 12:54:05 ip-172-31-41-232 hb[360735]:     cowboy_stream_h:execute/3 [/home/ubuntu/HyperBEAM/_build/default/lib/cowboy/src/cowboy_stream_h.erl:311]
+Sep 18 12:54:05 ip-172-31-41-232 hb[360735]:     cowboy_stream_h:request_process/3 [/home/ubuntu/HyperBEAM/_build/default/lib/cowboy/src/cowboy_stream_h.erl:300]
+Sep 18 12:54:05 ip-172-31-41-232 hb[360735]:     proc_lib:init_p_do_apply/3 [proc_lib.erl:329]
+Sep 18 12:54:05 ip-172-31-41-232 hb[360735]:   
+Sep 18 12:54:05 ip-172-31-41-232 hb[360735]:   
+Sep 18 12:54:05 ip-172-31-41-232 hb[360735]:   Error details:
+Sep 18 12:54:05 ip-172-31-41-232 hb[360735]:   
+Sep 18 12:54:05 ip-172-31-41-232 hb[360735]:     badarg
+Sep 18 12:54:05 ip-172-31-41-232 hb[360735]:   
+
+LISTEN 0      1024         0.0.0.0:8734       0.0.0.0:*                                  
+LISTEN 0      511          0.0.0.0:6363       0.0.0.0:*    users:(("node",pid=919,fd=21))

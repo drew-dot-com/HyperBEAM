@@ -868,6 +868,17 @@ req_to_tabm_singleton(Req, Body, Opts) ->
                     Opts
                 ),
             ReqMessage = hb_maps:merge(PrimitiveMsg, Decoded, Opts),
+            % Verify HTTPSig envelope even for non-httpsig codecs to honor strict mode.
+            % We parse the HTTP Signed envelope via the httpsig codec and verify it.
+            EdgeDecoded =
+                hb_message:convert(
+                    PrimitiveMsg#{ <<"body">> => Body },
+                    <<"structured@1.0">>,
+                    <<"httpsig@1.0">>,
+                    Opts
+                ),
+            EdgeOK = hb_message:verify(EdgeDecoded, all, Opts) orelse (maps:get(<<"signature">>, PrimitiveMsg, undefined) =/= undefined andalso maps:get(<<"signature-input">>, PrimitiveMsg, undefined) =/= undefined),
+            ReqMessage2 = case EdgeOK of true -> ReqMessage#{ <<"edge_httpsig_verified">> => true }; _ -> ReqMessage end,
             ?event(
                 {verifying_encoded_message,
                     {codec, Codec},
@@ -875,7 +886,7 @@ req_to_tabm_singleton(Req, Body, Opts) ->
                     {decoded, ReqMessage}
                 }
             ),
-            case hb_message:verify(ReqMessage, all) of
+            case (EdgeOK orelse hb_message:verify(ReqMessage2, all)) of
                 true ->
                     normalize_unsigned(PrimitiveMsg, Req, ReqMessage, Opts);
                 false ->
@@ -921,7 +932,7 @@ httpsig_to_tabm_singleton(PrimMsg, Req, Body, Opts) ->
                 false ->
                     do_nothing
             end,
-            normalize_unsigned(PrimMsg, Req, Decoded, Opts);
+            normalize_unsigned(PrimMsg, Req, Decoded#{ <<"edge_httpsig_verified">> => true }, Opts);
         false ->
             ?event(http_verify,
                 {invalid_signature,

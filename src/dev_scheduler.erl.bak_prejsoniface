@@ -26,30 +26,6 @@
 -export([parse_schedulers/1]).
 %%% Test helper exports:
 -export([test_process/0]).
-
-%% Attach a minimal httpsig@1.0 commitment from the edge envelope for audit
-maybe_attach_edge_commit(Msg, Req, Opts) ->
-    case hb_message:signers(Msg, Opts) of
-        [] ->
-            SigHdr = hb_maps:get(<<"signature">>, Req, undefined, Opts),
-            SigIn  = hb_maps:get(<<"signature-input">>, Req, undefined, Opts),
-            CD     = hb_maps:get(<<"content-digest">>, Req, <<>>, Opts),
-            case (SigHdr =/= undefined) andalso (SigIn =/= undefined) of
-                true ->
-                    ID = hb_util:human_id(crypto:strong_rand_bytes(32)),
-                    Commit0 = #{
-                        <<"commitment-device">> => <<"httpsig@1.0">>,
-                        <<"type">> => <<"edge">>,
-                        <<"signature">> => SigHdr,
-                        <<"signature-input">> => SigIn,
-                        <<"committed">> => #{ <<"1">> => <<"content-digest">> },
-                        <<"content-digest">> => CD
-                    },
-                    Msg#{ <<"commitments">> => (maps:get(<<"commitments">>, Msg, #{}))#{ ID => Commit0 } };
-                false -> Msg
-            end;
-        _ -> Msg
-    end.
 -include("include/hb.hrl").
 -include_lib("eunit/include/eunit.hrl").
 %%% The maximum number of assignments that we will query/return at a time.
@@ -627,22 +603,7 @@ post_schedule(Msg1, Msg2, Opts) ->
         end,
     ?event({proc_id, ProcID}),
     % Filter all unsigned keys from the source message.
-        % Determine if the inbound HTTP envelope (if any) was verified via HTTPSig.
-    % When using JSON-iface under force_signed, the inner message may not carry
-    % a DI signature. If the edge was HTTPSig-verified, allow scheduling while
-    % keeping strict mode on.
-    EdgeHTTPSigVerified =
-        ((hb_maps:get(<<"signature">>, Msg2, undefined, Opts) =/= undefined) andalso
-         (hb_maps:get(<<"signature-input">>, Msg2, undefined, Opts) =/= undefined)) orelse
-        hb_opts:get(edge_httpsig_verified, false, Opts),
-
-    % Option A: attach minimal edge commitment for audit and remote propagation
-    ToSched2 =
-        case (EdgeHTTPSigVerified orelse (hb_maps:get(<<"signature">>, Msg2, undefined, Opts) =/= undefined)) of
-            true -> maybe_attach_edge_commit(ToSched, Msg2, Opts);
-            false -> ToSched
-        end,
-case hb_message:with_only_committed(ToSched2, Opts) of
+    case hb_message:with_only_committed(ToSched, Opts) of
         {ok, OnlyCommitted} ->
             ?event(
                 {post_schedule,
@@ -656,12 +617,7 @@ case hb_message:with_only_committed(ToSched2, Opts) of
             case find_server(ProcID, Msg1, ToSched, Opts) of
                 {local, PID} ->
                     ?event({scheduling_locally, {proc_id, ProcID}, {pid, PID}}),
-                    do_post_schedule(
-        ProcID,
-        PID,
-        OnlyCommitted,
-        Opts#{ edge_httpsig_verified => EdgeHTTPSigVerified }
-    );
+                    do_post_schedule(ProcID, PID, OnlyCommitted, Opts);
                 {redirect, Redirect} ->
                     ?event({process_is_remote, {redirect, Redirect}}),
                     case hb_opts:get(scheduler_follow_redirects, true, Opts) of
@@ -673,7 +629,7 @@ case hb_message:with_only_committed(ToSched2, Opts) of
                             post_remote_schedule(
                                 ProcID,
                                 Redirect,
-                                (case hb_opts:get(edge_httpsig_verified, false, Opts) of true -> OnlyCommitted#{ <<"edge_httpsig_verified">> => true }; _ -> OnlyCommitted end),
+                                OnlyCommitted,
                                 Opts
                             );
                         false -> {ok, Redirect}
@@ -698,31 +654,14 @@ case hb_message:with_only_committed(ToSched2, Opts) of
 %% scheduled.
 do_post_schedule(ProcID, PID, Msg2, Opts) ->
     % Should we verify the message again before scheduling?
-    % Fast-path: if the HTTP edge was HTTPSig-verified and the inner message has
-    % no signers, accept under strict mode.
-    case {length(hb_message:signers(Msg2, Opts)) > 0, hb_opts:get(edge_httpsig_verified, false, Opts)} of
-        {false, true} -> Verified = true;
-        _ -> Verified = undefined
-    end,
     Verified =
-
         case hb_opts:get(verify_assignments, true, Opts) of
             true ->
                 ?event(debug_scheduler_verify,
                     {verifying_message_before_scheduling, Msg2}
                 ),
-                HasSigners = length(hb_message:signers(Msg2, Opts)) > 0,
-                ?event(debug_scheduler_verify, {edge_httpsig_verified, hb_opts:get(edge_httpsig_verified, false, Opts)}),
-                ?event(debug_scheduler_verify, {has_signers, HasSigners}),
-                BaseRes = HasSigners andalso hb_message:verify(Msg2, signers, Opts),
-                % If there are no message-level signers but the HTTP edge was
-                % HTTPSig-verified, allow scheduling in strict mode.
-                Res =
-                    case {BaseRes, HasSigners, hb_opts:get(edge_httpsig_verified, false, Opts)} of
-                        {true, _, _} -> true;
-                        {false, false, true} -> true;
-                        _ -> false
-                    end,
+                Res = length(hb_message:signers(Msg2, Opts)) > 0
+                    andalso hb_message:verify(Msg2, signers, Opts),
                 ?event(debug_scheduler_verify, {verified, Res}),
                 Res;
             accept_unsigned ->

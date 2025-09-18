@@ -404,9 +404,10 @@ handle_request(RawReq, Body, ServerID) ->
                 ),
                 % hb_tracer:record_step(TracePID, request_parsing),
                 % Invoke the meta@1.0 device to handle the request.
+                {SetRes, NodeMsg2} = set_opts(ReqSingleton, NodeMsg),
                 {ok, Res} =
                     dev_meta:handle(
-                        NodeMsg#{
+                        NodeMsg2#{
                             commitment_device => CommitmentCodec,
                             trace => TracePID
                         },
