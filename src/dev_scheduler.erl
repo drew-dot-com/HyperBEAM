@@ -420,6 +420,7 @@ get_location(_Msg1, Req, Opts) ->
                 }
             };
         {ok, Location} -> {ok, #{ <<"body">> => Location }}
+        end
     end.
 
 %% @doc Generate a new scheduler location record and register it. We both send 
@@ -605,6 +606,44 @@ schedule(Msg1, Msg2, Opts) ->
         get -> get_schedule(Msg1, Msg2, Opts)
     end.
 
+
+%% Normalize global scheduler payloads to native ~process schedule when possible
+normalize_scheduler_body(Req, Opts) ->
+    Body = hb_ao:get(<<"body">>, Req, undefined, Opts),
+    case Body of
+      %% A) structured inner ~json-iface@1.0 (scheduler -> json-iface -> Message)
+      #{ <<"device">> := <<"~json-iface@1.0">>, <<"body">> := Inner } ->
+          aosjson_to_native(Inner, Opts);
+      %% B) plain AOS JSON {type:"Message", Target, Tags, Data}
+      #{ <<"type">> := <<"Message">> } ->
+          aosjson_to_native(Body, Opts);
+      _ ->
+          {error, unsupported}
+    end.
+
+%% Convert {type:"Message", Target, Tags, Data} into native ~process@1.0/schedule body
+
+aosjson_to_native(J, Opts) when is_map(J) ->
+    Target = hb_ao:get(<<"Target">>, J, undefined, Opts),
+    Tags   = hb_ao:get(<<"Tags">>,   J, [],        Opts),
+    Data   = hb_ao:get(<<"Data">>,   J, <<>>,      Opts),
+    case Target of
+      undefined -> {error, badtarget};
+      _ ->
+        {ok, #{
+          <<"device">> => <<"~process@1.0">>,
+          <<"key">>    => <<"schedule">>,
+          <<"body">>   => #{
+            <<"Target">> => Target,
+            <<"Tags">>   => Tags,
+            <<"Data">>   => Data
+          }
+        }}
+    end;
+
+aosjson_to_native(_, _) -> {error, badshape}.
+
+%% Normalize global scheduler payloads to native ~process schedule when possible
 %% @doc Schedules a new message on the SU. Searches Msg1 for the appropriate ID,
 %% then uses the wallet address of the scheduler to determine if the message is
 %% for this scheduler. If so, it schedules the message and returns the assignment.
@@ -613,6 +652,10 @@ post_schedule(Msg1, Msg2, Opts) ->
     % Find the target message to schedule:
     ToSched = find_message_to_schedule(Msg1, Msg2, Opts),
     ?event({to_sched, ToSched}),
+    ToSched = case normalize_scheduler_body(ToSched, Opts) of
+                {ok, Norm} -> Norm;
+                _          -> ToSched
+              end,
     % Find the ProcessID of the target message:
     % - If it is a Process, use the ID of the message.
     % - If not, use the target as the ProcessID.
