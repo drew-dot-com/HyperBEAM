@@ -26,46 +26,8 @@
 -export([parse_schedulers/1]).
 %%% Test helper exports:
 -export([test_process/0]).
-
-%% Attach a minimal httpsig@1.0 commitment from the edge envelope for audit
-maybe_attach_edge_commit(Msg, Req, Opts) ->
-    case hb_message:signers(Msg, Opts) of
-        [] ->
-            SigHdr = hb_maps:get(<<"signature">>, Req, undefined, Opts),
-            SigIn  = hb_maps:get(<<"signature-input">>, Req, undefined, Opts),
-            CD     = hb_maps:get(<<"content-digest">>, Req, <<>>, Opts),
-            case (SigHdr =/= undefined) andalso (SigIn =/= undefined) of
-                true ->
-                    ID = hb_util:human_id(crypto:strong_rand_bytes(32)),
-                    Commit0 = #{
-                        <<"commitment-device">> => <<"httpsig@1.0">>,
-                        <<"type">> => <<"edge">>,
-                        <<"signature">> => SigHdr,
-                        <<"signature-input">> => SigIn,
-                        <<"committed">> => #{ <<"1">> => <<"content-digest">> },
-                        <<"content-digest">> => CD
-                    },
-                    Msg#{ <<"commitments">> => (maps:get(<<"commitments">>, Msg, #{}))#{ ID => Commit0 } };
-                false -> Msg
-            end;
-        _ -> Msg
-    end.
 -include("include/hb.hrl").
 -include_lib("eunit/include/eunit.hrl").
-%%% The maximum number of assignments that we will query/return at a time.
--define(MAX_ASSIGNMENT_QUERY_LEN, 1000).
-%%% The timeout for a lookahead worker.
--define(LOOKAHEAD_TIMEOUT, 1500).
-
-%% @doc Helper to ensure that the environment is started.
-start() ->
-    % We need the rocksdb backend to run for hb_cache module to work
-    application:ensure_all_started(hb),
-    <<I1:32/unsigned-integer, I2:32/unsigned-integer, I3:32/unsigned-integer>>
-        = crypto:strong_rand_bytes(12),
-    rand:seed(exsplus, {I1, I2, I3}),
-    ok.
-
 %% @doc This device uses a default_handler to route requests to the correct
 %% function.
 info() -> 
@@ -407,10 +369,7 @@ get_location(_Msg1, Req, Opts) ->
             Opts
         ),
     % Search for the location of the scheduler in the scheduler-location cache.
-    case hb_sched_loc:get(Address) of
-        {Url, Exp} -> {ok, #{ <<"address">> => Address, <<"url">> => Url, <<"expires_at">> => Exp }};
-        undefined ->
-            case dev_scheduler_cache:read_location(Address, Opts) of
+    case dev_scheduler_cache:read_location(Address, Opts) of
         not_found ->
             {ok,
                 #{
@@ -420,7 +379,6 @@ get_location(_Msg1, Req, Opts) ->
                 }
             };
         {ok, Location} -> {ok, #{ <<"body">> => Location }}
-        end
     end.
 
 %% @doc Generate a new scheduler location record and register it. We both send 
@@ -462,20 +420,6 @@ post_location(Msg1, RawReq, RawOpts) ->
             {error, _} -> -1
         end,
     NewNonce = hb_ao:get(<<"nonce">>, OnlyCommitted, ExistingNonce + 1, Opts),
-    %% HB ETS fast path for operator-signed direct mapping (address/url/ttl_ms)
-    Url0 = hb_ao:get(<<"url">>, OnlyCommitted, not_found, Opts),
-    case {Url0 =:= not_found, lists:member(Self, Signers)} of
-        {false, true} ->
-            TTL = hb_ao:get(<<"ttl_ms">>, OnlyCommitted, hb_opts:get(scheduler_location_ttl, 1000*60*60, Opts), Opts),
-            Addr0 = hb_ao:get(<<"address">>, OnlyCommitted, Self, Opts),
-            Exp0 = erlang:system_time(millisecond) + TTL,
-            ok = hb_sched_loc:put(Addr0, Url0, Exp0),
-            {ok, #{ <<"address">> => Addr0, <<"url">> => Url0, <<"ttl_ms">> => TTL, <<"expires_at">> => Exp0 }};
-        _ ->
-            %% fall through to existing nonce/registry behavior
-            nop
-    end,
-
     case {NewNonce > ExistingNonce, lists:member(Self, Signers)} of
         {false, _} ->
             % Invalid request: Known nonce is already higher than requested nonce
@@ -544,8 +488,8 @@ post_location(Msg1, RawReq, RawOpts) ->
             Codec =
                 hb_ao:get_first(
                     [
-                        {Msg1, <<"require-codec">>},
-                        {OnlyCommitted, <<"require-codec">>}
+                        {Msg1, <<"accept-codec">>},
+                        {OnlyCommitted, <<"accept-codec">>}
                     ],
                     <<"httpsig@1.0">>,
                     Opts
@@ -606,44 +550,6 @@ schedule(Msg1, Msg2, Opts) ->
         get -> get_schedule(Msg1, Msg2, Opts)
     end.
 
-
-%% Normalize global scheduler payloads to native ~process schedule when possible
-normalize_scheduler_body(Req, Opts) ->
-    Body = hb_ao:get(<<"body">>, Req, undefined, Opts),
-    case Body of
-      %% A) structured inner ~json-iface@1.0 (scheduler -> json-iface -> Message)
-      #{ <<"device">> := <<"~json-iface@1.0">>, <<"body">> := Inner } ->
-          aosjson_to_native(Inner, Opts);
-      %% B) plain AOS JSON {type:"Message", Target, Tags, Data}
-      #{ <<"type">> := <<"Message">> } ->
-          aosjson_to_native(Body, Opts);
-      _ ->
-          {error, unsupported}
-    end.
-
-%% Convert {type:"Message", Target, Tags, Data} into native ~process@1.0/schedule body
-
-aosjson_to_native(J, Opts) when is_map(J) ->
-    Target = hb_ao:get(<<"Target">>, J, undefined, Opts),
-    Tags   = hb_ao:get(<<"Tags">>,   J, [],        Opts),
-    Data   = hb_ao:get(<<"Data">>,   J, <<>>,      Opts),
-    case Target of
-      undefined -> {error, badtarget};
-      _ ->
-        {ok, #{
-          <<"device">> => <<"~process@1.0">>,
-          <<"key">>    => <<"schedule">>,
-          <<"body">>   => #{
-            <<"Target">> => Target,
-            <<"Tags">>   => Tags,
-            <<"Data">>   => Data
-          }
-        }}
-    end;
-
-aosjson_to_native(_, _) -> {error, badshape}.
-
-%% Normalize global scheduler payloads to native ~process schedule when possible
 %% @doc Schedules a new message on the SU. Searches Msg1 for the appropriate ID,
 %% then uses the wallet address of the scheduler to determine if the message is
 %% for this scheduler. If so, it schedules the message and returns the assignment.
@@ -652,59 +558,51 @@ post_schedule(Msg1, Msg2, Opts) ->
     % Find the target message to schedule:
     ToSched = find_message_to_schedule(Msg1, Msg2, Opts),
     ?event({to_sched, ToSched}),
-    ToSched = case normalize_scheduler_body(ToSched, Opts) of
-                {ok, Norm} -> Norm;
+    ToSched2 = case schedule_normalize_body(ToSched, Opts) of
+                {ok, Norm} -> hb_ao:get(<<"body">>, Norm, ToSched, Opts);
                 _          -> ToSched
               end,
     % Find the ProcessID of the target message:
     % - If it is a Process, use the ID of the message.
     % - If not, use the target as the ProcessID.
     ProcID =
-        case hb_ao:get(<<"type">>, ToSched, not_found, Opts) of
-            <<"Process">> -> hb_message:id(ToSched, all, Opts);
+        case hb_ao:get(<<"type">>, ToSched2, not_found, Opts) of
+            <<"Process">> -> hb_message:id(ToSched2, all, Opts);
             _ ->
-                case hb_ao:get(<<"target">>, ToSched, not_found, Opts) of
+                case hb_ao:get(<<"target">>, ToSched2, not_found, Opts) of
                     not_found -> find_target_id(Msg1, Msg2, Opts);
                     Target -> hb_util:human_id(Target)
                 end
         end,
-    ?event({proc_id, ProcID}),
-    % Filter all unsigned keys from the source message.
-        % Determine if the inbound HTTP envelope (if any) was verified via HTTPSig.
-    % When using JSON-iface under force_signed, the inner message may not carry
-    % a DI signature. If the edge was HTTPSig-verified, allow scheduling while
-    % keeping strict mode on.
+    % Allow HTTPSig-verified edge to stand in for inner DI signature
     EdgeHTTPSigVerified =
         ((hb_maps:get(<<"signature">>, Msg2, undefined, Opts) =/= undefined) andalso
          (hb_maps:get(<<"signature-input">>, Msg2, undefined, Opts) =/= undefined)) orelse
         hb_opts:get(edge_httpsig_verified, false, Opts),
 
-    % Option A: attach minimal edge commitment for audit and remote propagation
-    ToSched2 =
+    % Optionally attach minimal edge commitment for audit and remote propagation
+    ToSched3 =
         case (EdgeHTTPSigVerified orelse (hb_maps:get(<<"signature">>, Msg2, undefined, Opts) =/= undefined)) of
-            true -> maybe_attach_edge_commit(ToSched, Msg2, Opts);
-            false -> ToSched
+            true -> maybe_attach_edge_commit(ToSched2, Msg2, Opts);
+            false -> ToSched2
         end,
-case hb_message:with_only_committed(ToSched2, Opts) of
+    ?event({proc_id, ProcID}),
+    % Filter all unsigned keys from the source message.
+    case hb_message:with_only_committed(ToSched3, Opts) of
         {ok, OnlyCommitted} ->
             ?event(
                 {post_schedule,
                     {schedule_id, ProcID},
-                    {message, ToSched}
+                    {message, ToSched3}
                 }
             ),
             % Find the relevant scheduler server for the given process and
             % message, start a new one if necessary, or return a redirect to the
             % correct remote scheduler.
-            case find_server(ProcID, Msg1, ToSched, Opts) of
+            case find_server(ProcID, Msg1, ToSched3, Opts) of
                 {local, PID} ->
                     ?event({scheduling_locally, {proc_id, ProcID}, {pid, PID}}),
-                    do_post_schedule(
-        ProcID,
-        PID,
-        OnlyCommitted,
-        Opts#{ edge_httpsig_verified => EdgeHTTPSigVerified }
-    );
+                    do_post_schedule(ProcID, PID, OnlyCommitted, Opts);
                 {redirect, Redirect} ->
                     ?event({process_is_remote, {redirect, Redirect}}),
                     case hb_opts:get(scheduler_follow_redirects, true, Opts) of
@@ -716,7 +614,7 @@ case hb_message:with_only_committed(ToSched2, Opts) of
                             post_remote_schedule(
                                 ProcID,
                                 Redirect,
-                                (case hb_opts:get(edge_httpsig_verified, false, Opts) of true -> OnlyCommitted#{ <<"edge_httpsig_verified">> => true }; _ -> OnlyCommitted end),
+                                OnlyCommitted,
                                 Opts
                             );
                         false -> {ok, Redirect}
@@ -741,31 +639,14 @@ case hb_message:with_only_committed(ToSched2, Opts) of
 %% scheduled.
 do_post_schedule(ProcID, PID, Msg2, Opts) ->
     % Should we verify the message again before scheduling?
-    % Fast-path: if the HTTP edge was HTTPSig-verified and the inner message has
-    % no signers, accept under strict mode.
-    case {length(hb_message:signers(Msg2, Opts)) > 0, hb_opts:get(edge_httpsig_verified, false, Opts)} of
-        {false, true} -> Verified = true;
-        _ -> Verified = undefined
-    end,
     Verified =
-
         case hb_opts:get(verify_assignments, true, Opts) of
             true ->
                 ?event(debug_scheduler_verify,
                     {verifying_message_before_scheduling, Msg2}
                 ),
-                HasSigners = length(hb_message:signers(Msg2, Opts)) > 0,
-                ?event(debug_scheduler_verify, {edge_httpsig_verified, hb_opts:get(edge_httpsig_verified, false, Opts)}),
-                ?event(debug_scheduler_verify, {has_signers, HasSigners}),
-                BaseRes = HasSigners andalso hb_message:verify(Msg2, signers, Opts),
-                % If there are no message-level signers but the HTTP edge was
-                % HTTPSig-verified, allow scheduling in strict mode.
-                Res =
-                    case {BaseRes, HasSigners, hb_opts:get(edge_httpsig_verified, false, Opts)} of
-                        {true, _, _} -> true;
-                        {false, false, true} -> true;
-                        _ -> false
-                    end,
+                Res = length(hb_message:signers(Msg2, Opts)) > 0
+                    andalso hb_message:verify(Msg2, signers, Opts),
                 ?event(debug_scheduler_verify, {verified, Res}),
                 Res;
             accept_unsigned ->
@@ -1822,7 +1703,7 @@ register_location_on_boot_test() ->
                         <<"path">> => <<"location">>,
                         <<"method">> => <<"POST">>,
                         <<"target">> => <<"self">>,
-                        <<"require-codec">> => <<"ans104@1.0">>,
+                        <<"accept-codec">> => <<"ans104@1.0">>,
                         <<"url">> => <<"https://hyperbeam-test-ignore.com">>,
                         <<"hook">> => #{
                             <<"result">> => <<"ignore">>,
@@ -1995,7 +1876,7 @@ register_scheduler_test() ->
         <<"url">> => <<"https://hyperbeam-test-ignore.com">>,
         <<"method">> => <<"POST">>,
         <<"nonce">> => 1,
-        <<"require-codec">> => <<"ans104@1.0">>
+        <<"accept-codec">> => <<"ans104@1.0">>
     }, Wallet),
     {ok, Res} = hb_http:post(Node, Msg1, #{}),
     ?assertMatch(#{ <<"url">> := Location } when is_binary(Location), Res).
@@ -2394,3 +2275,42 @@ benchmark_suite(Port, Base) ->
             desc => <<"100xRocksDB store, aggressive conf, http/3.">>
         }
     ].
+
+%% -- DrewGle: tolerant scheduler normalization helpers --
+%% Accept structured (~json-iface) or plain AOS JSON and build native schedule
+schedule_normalize_body(Req, Opts) ->
+    Body = hb_ao:get(<<"body">>, Req, undefined, Opts),
+    case Body of
+      #{ <<"device">> := <<"~json-iface@1.0">>, <<"body">> := Inner } ->
+          aosjson_to_schedule(Inner, Opts);
+      #{ <<"type">> := <<"Message">> } ->
+          aosjson_to_schedule(Body, Opts);
+      _ -> {error, unsupported}
+    end.
+
+aosjson_to_schedule(J, Opts) when is_map(J) ->
+    Target = hb_ao:get(<<"Target">>, J, undefined, Opts),
+    Tags   = hb_ao:get(<<"Tags">>,   J, [],        Opts),
+    Data   = hb_ao:get(<<"Data">>,   J, <<>>,      Opts),
+    case Target of
+      undefined -> {error, badtarget};
+      _ ->
+        PortBin = hb_util:bin(hb_opts:get(port, 8734, Opts)),
+        Host = hb_opts:get(host, <<"localhost">>, Opts),
+        Protocol = hb_opts:get(protocol, http1, Opts),
+        ProtoStr = case Protocol of http1 -> <<"http">>; _ -> <<"https">> end,
+        URL = <<ProtoStr/binary, "://", Host/binary, ":", PortBin/binary>>,
+        {ok, #{
+          <<"device">> => <<"~process@1.0">>,
+          <<"key">>    => <<"schedule">>,
+          <<"body">>   => #{
+            <<"target">> => Target,
+            <<"tags">>   => Tags,
+            <<"data">>   => Data,
+            <<"scheduler-location">> => URL
+          }
+        }}
+    end;
+
+aosjson_to_schedule(_, _) -> {error, badshape}.
+%% -- end DrewGle helpers --
