@@ -558,7 +558,7 @@ post_schedule(Msg1, Msg2, Opts) ->
     % Find the target message to schedule:
     ToSched = find_message_to_schedule(Msg1, Msg2, Opts),
     ?event({to_sched, ToSched}),
-    ToSched2 = case schedule_normalize_body(ToSched, Opts) of
+    ToSched2 = case schedule_normalize_body(Msg1, ToSched, Opts) of
                 {ok, Norm} -> hb_ao:get(<<"body">>, Norm, ToSched, Opts);
                 _          -> ToSched
               end,
@@ -2278,19 +2278,27 @@ benchmark_suite(Port, Base) ->
 
 %% -- DrewGle: tolerant scheduler normalization helpers --
 %% Accept structured (~json-iface) or plain AOS JSON and build native schedule
-schedule_normalize_body(Req, Opts) ->
+schedule_normalize_body(Msg1, Req, Opts) ->
     Body = hb_ao:get(<<"body">>, Req, undefined, Opts),
     case Body of
       #{ <<"device">> := <<"~json-iface@1.0">>, <<"body">> := Inner } ->
-          aosjson_to_schedule(Inner, Opts);
+          aosjson_to_schedule(Inner, Msg1, Opts);
       #{ <<"type">> := <<"Message">> } ->
-          aosjson_to_schedule(Body, Opts);
+          aosjson_to_schedule(Body, Msg1, Opts);
       _ -> {error, unsupported}
     end.
 
-aosjson_to_schedule(J, Opts) when is_map(J) ->
-    Target = hb_ao:get(<<"Target">>, J, undefined, Opts),
+aosjson_to_schedule(J, Msg1, Opts) when is_map(J) ->
     Tags   = hb_ao:get(<<"Tags">>,   J, [],        Opts),
+    Target0 = hb_ao:get(<<"Target">>, J, undefined, Opts),
+    Target = case Target0 of
+        undefined ->
+            case hb_ao:get(<<"type">>, Msg1, Opts) of
+                <<"Process">> -> hb_message:id(Msg1, all, Opts);
+                _ -> undefined
+            end;
+        _ -> Target0
+    end,
     Data   = hb_ao:get(<<"Data">>,   J, <<>>,      Opts),
     case Target of
       undefined -> {error, badtarget};
@@ -2312,5 +2320,5 @@ aosjson_to_schedule(J, Opts) when is_map(J) ->
         }}
     end;
 
-aosjson_to_schedule(_, _) -> {error, badshape}.
+aosjson_to_schedule(_, _, _) -> {error, badshape}.
 %% -- end DrewGle helpers --
