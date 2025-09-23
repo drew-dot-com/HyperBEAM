@@ -382,17 +382,24 @@ get_location(_Msg1, Req, Opts) ->
             )),
             Opts
         ),
-    % Search for the location of the scheduler in the scheduler-location cache.
-    case dev_scheduler_cache:read_location(Address, Opts) of
+    % Search for the location of the scheduler in the persistent store first.
+    case hb_sched_loc_store:get(Address) of
+        {ok, Url} ->
+            {ok, #{ <<"body">> => scheduler_location_from_store(Address, Url, Opts) }};
         not_found ->
-            {ok,
-                #{
-                    <<"status">> => 404,
-                    <<"body">> =>
-                        <<"No location found for address: ", Address/binary>>
-                }
-            };
-        {ok, Location} -> {ok, #{ <<"body">> => Location }}
+            case dev_scheduler_cache:read_location(Address, Opts) of
+                not_found ->
+                    {ok,
+                        #{
+                            <<"status">> => 404,
+                            <<"body">> =>
+                                <<"No location found for address: ", Address/binary>>
+                        }
+                    };
+                {ok, Location} ->
+                    hb_sched_loc_store:record_location(Location, Opts),
+                    {ok, #{ <<"body">> => Location }}
+            end
     end.
 
 %% @doc Generate a new scheduler location record and register it. We both send 
@@ -452,6 +459,7 @@ post_location(Msg1, RawReq, RawOpts) ->
             % that is not the operator.
             case dev_scheduler_cache:write_location(OnlyCommitted, Opts) of
                 ok ->
+                    hb_sched_loc_store:record_location(OnlyCommitted, Opts),
                     ?event(scheduler_location,
                         {cached_foreign_peer_location, OnlyCommitted}
                     ),
@@ -520,6 +528,8 @@ post_location(Msg1, RawReq, RawOpts) ->
                 },
             Signed = hb_message:commit(NewSchedulerLocation, Opts, Codec),
             dev_scheduler_cache:write_location(Signed, Opts),
+            hb_sched_loc_store:record_location(Signed, Opts),
+            hb_sched_loc_store:maybe_seed(Self, URL),
             ?event(scheduler_location,
                 {uploading_signed_scheduler_location, Signed}
             ),
@@ -902,6 +912,15 @@ extract_hint_url(Hint, Opts) when is_map(Hint) ->
         Url -> {ok, Url}
     end;
 extract_hint_url(_, _) -> error.
+
+scheduler_location_from_store(Address, Url, _Opts) ->
+    #{
+        <<"data-protocol">> => <<"ao">>,
+        <<"variant">> => <<"ao.N.1">>,
+        <<"type">> => <<"scheduler-location">>,
+        <<"address">> => Address,
+        <<"url">> => Url
+    }.
 
 %% @doc If a hint is present in the string, return it. Else, return not_found.
 get_hint(Str, Opts) when is_binary(Str) ->
