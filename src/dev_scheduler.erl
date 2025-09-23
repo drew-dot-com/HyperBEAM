@@ -738,11 +738,13 @@ find_server(ProcID, Msg1, ToSched, Opts) ->
                                 }
                             ),
                             ParsedLoc = parse_schedulers(SchedLoc),
+                            persist_scheduler_hints(ParsedLoc, Opts),
                             case is_local_scheduler(ProcID, Proc, ParsedLoc, Opts) of
                                 {ok, PID} ->
                                     % We are the scheduler. Start the server if
                                     % it has not already been started, with the
                                     % given options.
+                                    seed_local_scheduler_addresses(ParsedLoc, Opts),
                                     {local, PID};
                                 false ->
                                     % We are not the scheduler. Find it and
@@ -812,6 +814,95 @@ is_local_scheduler(ProcID, ProcMsg, Scheduler, Opts) ->
         {error, _} -> false
     end.
 
+persist_scheduler_hints(Schedulers, Opts) ->
+    lists:foreach(fun(S) -> maybe_store_hint(S, Opts) end, ensure_list(Schedulers)).
+
+seed_local_scheduler_addresses(Schedulers, Opts) ->
+    Url = hb_sched_loc_store:local_url(),
+    lists:foreach(fun(S) -> maybe_seed_local_hint(S, Url, Opts) end, ensure_list(Schedulers)).
+
+maybe_store_hint(Value, Opts) when is_map(Value) ->
+    Addresses = extract_hint_addresses(Value, Opts),
+    Url = hint_url(Value, Opts),
+    case {Addresses, Url} of
+        {[_|_] = Addrs, MapUrl} when is_binary(MapUrl) ->
+            lists:foreach(fun(A) -> hb_sched_loc_store:maybe_seed(A, MapUrl) end, Addrs);
+        _ -> ok
+    end;
+maybe_store_hint(_, _) -> ok.
+
+maybe_seed_local_hint(Value, Url, Opts) when is_map(Value) ->
+    lists:foreach(fun(A) -> hb_sched_loc_store:maybe_seed(A, Url) end, extract_hint_addresses(Value, Opts));
+maybe_seed_local_hint(Value, Url, _Opts) when is_binary(Value) ->
+    case looks_like_address(Value) of
+        true -> hb_sched_loc_store:maybe_seed(Value, Url);
+        false -> ok
+    end;
+maybe_seed_local_hint(_, _, _) -> ok.
+
+extract_hint_addresses(Map, Opts) ->
+    Candidates = [
+        hb_ao:get(<<"address">>, Map, undefined, Opts),
+        hb_ao:get(<<"scheduler">>, Map, undefined, Opts)
+    ],
+    lists:usort([ Addr || Addr <- lists:filtermap(fun maybe_to_address/1, Candidates) ]).
+
+extract_hint_address(Map, Opts) ->
+    case extract_hint_addresses(Map, Opts) of
+        [Addr | _] -> Addr;
+        [] -> not_found
+    end.
+
+maybe_to_address(undefined) -> false;
+maybe_to_address(Value) when is_binary(Value) ->
+    case looks_like_address(Value) of
+        true -> {true, Value};
+        false -> false
+    end;
+maybe_to_address(Value) when is_list(Value) ->
+    Bin = hb_util:bin(Value),
+    case looks_like_address(Bin) of
+        true -> {true, Bin};
+        false -> false
+    end;
+maybe_to_address(_) -> false.
+
+hint_url(Map, Opts) ->
+    case hb_ao:get(<<"url">>, Map, not_found, Opts) of
+        not_found -> hb_ao:get(<<"location">>, Map, not_found, Opts);
+        Url -> Url
+    end.
+
+ensure_list(Value) when is_list(Value) -> Value;
+ensure_list(Value) -> [Value].
+
+looks_like_address(Value) when is_binary(Value) ->
+    case binary:match(Value, <<"://">>) of
+        nomatch -> true;
+        _ -> false
+    end;
+looks_like_address(Value) when is_list(Value) ->
+    looks_like_address(hb_util:bin(Value));
+looks_like_address(_) -> false.
+
+maybe_seed_hint(Target, Hint, Opts) ->
+    Address =
+        try without_hint(Target)
+        catch _:_ -> Target
+        end,
+    case {looks_like_address(Address), extract_hint_url(Hint, Opts)} of
+        {true, {ok, Url}} -> hb_sched_loc_store:maybe_seed(Address, Url);
+        _ -> ok
+    end.
+
+extract_hint_url(Hint, _Opts) when is_binary(Hint) -> {ok, Hint};
+extract_hint_url(Hint, Opts) when is_map(Hint) ->
+    case hint_url(Hint, Opts) of
+        not_found -> error;
+        Url -> {ok, Url}
+    end;
+extract_hint_url(_, _) -> error.
+
 %% @doc If a hint is present in the string, return it. Else, return not_found.
 get_hint(Str, Opts) when is_binary(Str) ->
     case hb_opts:get(scheduler_follow_hints, true, Opts) of
@@ -877,43 +968,70 @@ find_remote_scheduler(ProcID, [Scheduler | Rest], Opts) ->
         {ok, Redirect} ->
             {ok, Redirect}
     end;
+find_remote_scheduler(ProcID, Scheduler, Opts) when is_map(Scheduler) ->
+    Address = extract_hint_address(Scheduler, Opts),
+    Url = hint_url(Scheduler, Opts),
+    case {Address, Url} of
+        {Addr, MapUrl} when is_binary(Addr) andalso is_binary(MapUrl) ->
+            hb_sched_loc_store:maybe_seed(Addr, MapUrl),
+            generate_redirect(ProcID, Scheduler#{ <<"url">> => MapUrl }, Opts);
+        {Addr, not_found} when is_binary(Addr) ->
+            case hb_sched_loc_store:get(Addr) of
+                {ok, FoundUrl} ->
+                    hb_sched_loc_store:maybe_seed(Addr, FoundUrl),
+                    generate_redirect(ProcID, #{ <<"url">> => FoundUrl }, Opts);
+                not_found ->
+                    find_remote_scheduler(ProcID, Addr, Opts)
+            end;
+        {not_found, MapUrl} when is_binary(MapUrl) ->
+            generate_redirect(ProcID, Scheduler#{ <<"url">> => MapUrl }, Opts);
+        _ -> {error, not_found}
+    end;
 find_remote_scheduler(ProcID, Scheduler, Opts) ->
     % Parse the scheduler location to see if it has a hint. If there is a hint,
     % we will use it to construct a redirect message.
     case get_hint(Scheduler, Opts) of
         {ok, Hint} ->
-            % We have a hint. Construct a redirect message.
+            % We have a hint. Construct a redirect message. Persist the mapping if possible.
+            maybe_seed_hint(Scheduler, Hint, Opts),
             generate_redirect(ProcID, Hint, Opts);
         not_found ->
-            case dev_scheduler_cache:read_location(Scheduler, Opts) of
-                {ok, SchedMsg} ->
-                    % We have a cached scheduler location. Use it to construct a
-                    % redirect message.
-                    generate_redirect(ProcID, SchedMsg, Opts);
+            case hb_sched_loc_store:get(Scheduler) of
+                {ok, Url} ->
+                    generate_redirect(ProcID, #{ <<"url">> => Url }, Opts);
                 not_found ->
-                    % We have not yet cached the location for this address.
-                    % Find it via the gateway.
-                    case hb_gateway_client:scheduler_location(Scheduler, Opts) of
+                    case dev_scheduler_cache:read_location(Scheduler, Opts) of
                         {ok, SchedMsg} ->
-                            % We have found the location. Cache it and use it to
-                            % construct a redirect message.
-                            Res =
-                                dev_scheduler_cache:write_location(
-                                    SchedMsg,
-                                    Opts
-                                ),
-                            ?event(scheduler_location,
-                                {cached_scheduler_location, {res, Res}}
-                            ),
+                            % We have a cached scheduler location. Use it to construct a
+                            % redirect message.
+                            hb_sched_loc_store:record_location(SchedMsg, Opts),
                             generate_redirect(ProcID, SchedMsg, Opts);
-                        {error, Res} ->
-                            ?event(
-                                scheduler_location,
-                                {failed_to_find_scheduler_location_from_gateway,
+                        not_found ->
+                            % We have not yet cached the location for this address.
+                            % Find it via the gateway.
+                            case hb_gateway_client:scheduler_location(Scheduler, Opts) of
+                                {ok, SchedMsg} ->
+                                    % We have found the location. Cache it and use it to
+                                    % construct a redirect message.
+                                    Res =
+                                        dev_scheduler_cache:write_location(
+                                            SchedMsg,
+                                            Opts
+                                        ),
+                                    ?event(scheduler_location,
+                                        {cached_scheduler_location, {res, Res}}
+                                    ),
+                                    hb_sched_loc_store:record_location(SchedMsg, Opts),
+                                    generate_redirect(ProcID, SchedMsg, Opts);
+                                {error, Res} ->
+                                    ?event(
+                                        scheduler_location,
+                                        {failed_to_find_scheduler_location_from_gateway,
+                                            {error, Res}
+                                        }
+                                    ),
                                     {error, Res}
-                                }
-                            ),
-                            {error, Res}
+                            end
                     end
             end
     end.
