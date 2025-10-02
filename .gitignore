@@ -1,3 +1,5 @@
+lib_backup/
+lib/
 config.*
 .rebar3
 _build
