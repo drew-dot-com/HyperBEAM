@@ -62,7 +62,7 @@
 -export([verify/1, verify/2, verify/3, commit/2, commit/3, signers/2, type/1, minimize/1]).
 -export([normalize_commitments/2, is_signed_key/3]).
 -export([commitment/2, commitment/3, commitments/3]).
--export([with_only_committed/2, without_unless_signed/3]).
+-export([with_only_committed/1, with_only_committed/2, without_unless_signed/3]).
 -export([with_commitments/3, without_commitments/3]).
 -export([diff/3, match/2, match/3, match/4, find_target/3]).
 %%% Helpers:
@@ -234,6 +234,9 @@ normalize_commitments(Msg, _Opts) ->
 %% ...before using the output of this function as the 'canonical' message. This
 %% is such that expensive operations like signature verification are not
 %% performed unless necessary.
+with_only_committed(Msg) ->
+    with_only_committed(Msg, #{}).
+
 with_only_committed(Msg, Opts) when is_map(Msg) ->
     ?event({with_only_committed, {msg, Msg}, {opts, Opts}}),
     Comms = hb_maps:get(<<"commitments">>, Msg, not_found, Opts),

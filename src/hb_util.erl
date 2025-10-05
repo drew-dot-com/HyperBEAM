@@ -7,7 +7,7 @@
 -export([encode/1, decode/1, safe_encode/1, safe_decode/1]).
 -export([find_value/2, find_value/3]).
 -export([deep_merge/3, deep_set/4, deep_get/3, deep_get/4]).
--export([number/1, list_to_numbered_message/1]).
+-export([number/1, list_to_numbered_message/1, list_to_numbered_map/1]).
 -export([find_target_path/2, template_matches/3]).
 -export([is_ordered_list/2, message_to_ordered_list/1, message_to_ordered_list/2]).
 -export([numbered_keys_to_list/2]).
@@ -25,6 +25,9 @@
 -export([check_size/2, check_value/2, check_type/2, ok_or_throw/3]).
 -export([all_atoms/0, binary_is_atom/1]).
 -export([lower_case_key_map/2]).
+-export([debug_print/1, debug_print/2, debug_print/4]).
+-export([debug_format/1, debug_format/2, debug_format/3]).
+-export([eunit_print/2]).
 -include("include/hb.hrl").
 
 
@@ -336,6 +339,10 @@ list_to_numbered_message(Msg) when is_map(Msg) ->
 list_to_numbered_message(List) ->
     hb_maps:from_list(number(List)).
 
+%% @doc Convert a list of elements to a map with numbered keys.
+list_to_numbered_map(List) when is_list(List) ->
+    hb_maps:from_list(number(List)).
+
 %% @doc Determine if the message given is an ordered list, starting from 1.
 is_ordered_list(Msg, _Opts) when is_list(Msg) -> true;
 is_ordered_list(Msg, Opts) ->
@@ -511,6 +518,26 @@ maybe_throw(Val, Opts) ->
         throw -> throw(Val);
         _ -> Val
     end.
+
+%% @doc Legacy wrapper for debug printing via hb_format.
+debug_print(X) ->
+    hb_format:print(X).
+debug_print(X, Info) ->
+    hb_format:print(X, Info, #{}).
+debug_print(X, Mod, Func, Line) ->
+    hb_format:print(X, Mod, Func, Line).
+
+%% @doc Legacy wrapper for term formatting.
+debug_format(X) ->
+    hb_format:term(X).
+debug_format(X, Opts) ->
+    hb_format:term(X, Opts).
+debug_format(X, Opts, Indent) ->
+    hb_format:term(X, Opts, Indent).
+
+%% @doc Legacy wrapper for EUnit-friendly printing.
+eunit_print(FmtStr, FmtArgs) ->
+    hb_format:eunit_print(FmtStr, FmtArgs).
 
 %% @doc Is the given module part of HyperBEAM?
 is_hb_module(Atom) ->
