@@ -706,50 +706,68 @@ find_server(ProcID, Msg1, ToSched, Opts) ->
             generate_redirect(ProcID, Hint, Opts);
         not_found ->
             ?event({no_hint_in_proc_id, ProcID}),
-            case dev_scheduler_registry:find(ProcID, false, Opts) of
-                PID when is_pid(PID) ->
-                    ?event({found_pid_in_local_registry, PID}),
-                    {local, PID};
-                not_found ->
-                    ?event({no_pid_in_local_registry, ProcID}),
-                    Proc = find_process_message(ProcID, Msg1, ToSched, Opts),
-                    ?event({found_process, {process, Proc}, {msg1, Msg1}}),
-                    SchedLoc =
-                        hb_ao:get_first(
-                            [
-                                {Proc, <<"scheduler">>},
-                                {Proc, <<"scheduler-location">>}
-                            ] ++
-                            case ToSched of
-                                undefined -> [];
-                                _ -> [{ToSched, <<"scheduler-location">>}]
-                            end,
-                            not_found,
-                            Opts#{ hashpath => ignore }
-                        ),
-                    ?event({sched_loc, SchedLoc}),
-                    case SchedLoc of
-                        not_found ->
-                            {error, <<"No scheduler information provided.">>};
-                        _ ->
-                            ?event(
-                                {confirming_if_scheduler_is_local,
-                                    {addr, SchedLoc}
-                                }
-                            ),
-                            ParsedLoc = parse_schedulers(SchedLoc),
-                            case is_local_scheduler(ProcID, Proc, ParsedLoc, Opts) of
-                                {ok, PID} ->
-                                    % We are the scheduler. Start the server if
-                                    % it has not already been started, with the
-                                    % given options.
-                                    {local, PID};
-                                false ->
-                                    % We are not the scheduler. Find it and
-                                    % return a redirect.
-                                    find_remote_scheduler(ProcID, ParsedLoc, Opts)
+            ExistingPID = dev_scheduler_registry:find(ProcID, false, Opts),
+            ExistingLocal = maybe_existing_local_pid(ExistingPID),
+            try
+                Proc = find_process_message(ProcID, Msg1, ToSched, Opts),
+                ?event({found_process, {process, Proc}, {msg1, Msg1}}),
+                SchedLoc = scheduler_location(Proc, ToSched, Opts),
+                ?event({sched_loc, SchedLoc}),
+                case SchedLoc of
+                    not_found ->
+                        maybe_use_existing_local(
+                            ExistingLocal,
+                            fun() ->
+                                ?event({no_pid_in_local_registry, ProcID}),
+                                {error, <<"No scheduler information provided.">>}
                             end
-                    end
+                        );
+                    _ ->
+                        ?event(
+                            {confirming_if_scheduler_is_local,
+                                {addr, SchedLoc}
+                            }
+                        ),
+                        ParsedLoc = parse_schedulers(SchedLoc),
+                        case maybe_local_location(ProcID, Proc, ParsedLoc, Opts) of
+                            {local, LocalPid} -> {local, LocalPid};
+                            not_local ->
+                                ?event({process_is_remote, {locations, ParsedLoc}}),
+                                find_remote_scheduler(ProcID, ParsedLoc, Opts)
+                        end
+                end
+            catch
+                throw:{process_not_available, _} = ProcErr ->
+                    maybe_use_existing_local(
+                        ExistingLocal,
+                        fun() ->
+                            case scheduler_location(undefined, ToSched, Opts) of
+                                not_found -> throw(ProcErr);
+                                RemoteLoc ->
+                                    ParsedLoc1 = parse_schedulers(RemoteLoc),
+                                    ?event({process_is_remote,
+                                        {locations, ParsedLoc1},
+                                        {source, bypass_process}}
+                                    ),
+                                    find_remote_scheduler(ProcID, ParsedLoc1, Opts)
+                            end
+                        end
+                    );
+                throw:Error ->
+                    maybe_use_existing_local(
+                        ExistingLocal,
+                        fun() -> throw(Error) end
+                    );
+                error:Reason:Stacktrace ->
+                    maybe_use_existing_local(
+                        ExistingLocal,
+                        fun() -> erlang:raise(error, Reason, Stacktrace) end
+                    );
+                exit:Reason:Stacktrace ->
+                    maybe_use_existing_local(
+                        ExistingLocal,
+                        fun() -> erlang:raise(exit, Reason, Stacktrace) end
+                    )
             end
     end.
 
@@ -811,6 +829,49 @@ is_local_scheduler(ProcID, ProcMsg, Scheduler, Opts) ->
             };
         {error, _} -> false
     end.
+
+maybe_local_location(ProcID, ProcMsg, ParsedLoc, Opts) ->
+    case is_local_scheduler(ProcID, ProcMsg, ParsedLoc, Opts) of
+        {ok, LocalPid} ->
+            {local, LocalPid};
+        false ->
+            not_local
+    end.
+
+scheduler_location(Proc, ToSched, Opts) ->
+    Candidates =
+        (case Proc of
+            undefined -> [];
+            _ -> [{Proc, <<"scheduler">>}, {Proc, <<"scheduler-location">>}]
+        end) ++
+        case ToSched of
+            undefined -> [];
+            _ ->
+                [
+                    {ToSched, <<"scheduler-location">>},
+                    {ToSched, <<"scheduler">>}
+                ]
+        end,
+    case Candidates of
+        [] -> not_found;
+        _ ->
+            hb_ao:get_first(
+                Candidates,
+                not_found,
+                Opts#{ hashpath => ignore }
+            )
+    end.
+
+maybe_existing_local_pid(Pid) when is_pid(Pid) ->
+    {local_pid, Pid};
+maybe_existing_local_pid(_) ->
+    no_local_pid.
+
+maybe_use_existing_local({local_pid, Pid}, _FallbackFun) ->
+    ?event({found_pid_in_local_registry, Pid}),
+    {local, Pid};
+maybe_use_existing_local(no_local_pid, FallbackFun) ->
+    FallbackFun().
 
 %% @doc If a hint is present in the string, return it. Else, return not_found.
 get_hint(Str, Opts) when is_binary(Str) ->
@@ -877,7 +938,17 @@ find_remote_scheduler(ProcID, [Scheduler | Rest], Opts) ->
         {ok, Redirect} ->
             {ok, Redirect}
     end;
+find_remote_scheduler(ProcID, Scheduler, Opts) when is_binary(Scheduler) ->
+    case is_http_scheduler_location(Scheduler) of
+        true ->
+            generate_redirect(ProcID, Scheduler, Opts);
+        false ->
+            find_remote_scheduler_binary(ProcID, Scheduler, Opts)
+    end;
 find_remote_scheduler(ProcID, Scheduler, Opts) ->
+    find_remote_scheduler_binary(ProcID, Scheduler, Opts).
+
+find_remote_scheduler_binary(ProcID, Scheduler, Opts) ->
     % Parse the scheduler location to see if it has a hint. If there is a hint,
     % we will use it to construct a redirect message.
     case get_hint(Scheduler, Opts) of
@@ -917,6 +988,15 @@ find_remote_scheduler(ProcID, Scheduler, Opts) ->
                     end
             end
     end.
+
+is_http_scheduler_location(Scheduler) when is_binary(Scheduler) ->
+    lists:any(
+        fun(Prefix) ->
+            binary:match(Scheduler, Prefix) =:= {0, byte_size(Prefix)}
+        end,
+        [<<"http://">>, <<"https://">>]
+    );
+is_http_scheduler_location(_) -> false.
 
 %% @doc Returns information about the current slot for a process.
 slot(M1, M2, Opts) ->

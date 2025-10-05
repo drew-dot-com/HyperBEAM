@@ -58,7 +58,8 @@ commitment_to_sf_siginfo(Msg, Commitment, Opts) ->
     % `keyid' in the `signature-input' keys.
     KeyID = maps:get(<<"keyid">>, Commitment, <<>>),
     % Extract the signature from the commitment.
-    Signature = hb_util:decode(maps:get(<<"signature">>, Commitment)),
+    {Signature, ProvidedLabel} =
+        normalize_signature_value(maps:get(<<"signature">>, Commitment)),
     % Extract the keys present in the commitment.
     CommittedKeys = to_siginfo_keys(Msg, Commitment, Opts),
     ?event({normalized_for_enc, CommittedKeys, {commitment, Commitment}}),
@@ -69,7 +70,12 @@ commitment_to_sf_siginfo(Msg, Commitment, Opts) ->
     Created = maps:get(<<"created">>, Commitment, undefined),
     Expires = maps:get(<<"expires">>, Commitment, undefined),
     % Generate the name of the signature.
-    SigName = hb_util:to_lower(hb_util:human_id(crypto:hash(sha256, Signature))),
+    SigName =
+        case ProvidedLabel of
+            <<"comm-", Base/binary>> when Base =/= <<>> ->
+                hb_util:to_lower(Base);
+            _ -> hb_util:to_lower(hb_util:human_id(crypto:hash(sha256, Signature)))
+        end,
     % Generate the signature input and signature structured-fields. These can 
     % then be placed into a dictionary with other commitments and transformed
     % into their binary representations.
@@ -112,6 +118,20 @@ commitment_to_sf_siginfo(Msg, Commitment, Opts) ->
         }
     ),
     {ok, SigName, SFSig, SFSigInput}.
+
+normalize_signature_value(Signature) when is_binary(Signature) ->
+    try {hb_util:decode(Signature), undefined}
+    catch
+        error:badarg ->
+            case binary:split(Signature, <<":">>, [global]) of
+                [Label, Encoded, <<>>] ->
+                    {hb_util:decode(Encoded), Label};
+                _ ->
+                    erlang:error(badarg)
+            end
+    end;
+normalize_signature_value(Signature) ->
+    {hb_util:decode(Signature), undefined}.
 
 get_additional_params(Commitment) ->
     AdditionalParams =
