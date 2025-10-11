@@ -149,23 +149,19 @@ latest(ProcID, RawOpts) ->
 %% @doc Read the latest known scheduler location for an address.
 read_location(Address, RawOpts) ->
     Opts = opts(RawOpts),
-    Res =
-        hb_cache:read(
-            hb_store:path(hb_opts:get(store, no_viable_store, Opts), [
-                ?SCHEDULER_CACHE_PREFIX,
-                "locations",
-                hb_util:human_id(Address)
-            ]),
-            Opts
-        ),
-    Event =
-        case Res of
-            {ok, _} -> found_in_store;
-            not_found -> not_found_in_store;
-            _ -> local_lookup_unexpected_result
+    Store = hb_opts:get(store, no_viable_store, Opts),
+    ResultWithEvent =
+        case safe_human_id(Address) of
+            undefined -> fallback_location(Address, Opts);
+            Key ->
+                Path = hb_store:path(Store, [
+                    ?SCHEDULER_CACHE_PREFIX,
+                    "locations",
+                    Key
+                ]),
+                maybe_use_fallback(hb_cache:read(Path, Opts), Address, Opts)
         end,
-    ?event(scheduler_location, {Event, {address, Address}, {res, Res}}),
-    Res.
+    finalize_scheduler_location_result(Address, ResultWithEvent).
 
 %% @doc Write the latest known scheduler location for an address.
 write_location(LocationMsg, RawOpts) ->
@@ -205,6 +201,89 @@ write_location(LocationMsg, RawOpts) ->
             ?event(warning, {failed_to_cache_location_msg, {reason, Reason}}),
             {error, Reason}
     end.
+
+maybe_use_fallback(Res0, Address, Opts) ->
+    case Res0 of
+        {ok, Msg} when is_map(Msg) ->
+            case is_http_status_404(maps:get(<<"status">>, Msg, undefined)) of
+                true -> fallback_location(Address, Opts);
+                false -> {found_in_store, Res0}
+            end;
+        {ok, _} -> {found_in_store, Res0};
+        not_found -> fallback_location(Address, Opts);
+        Other -> {local_lookup_unexpected_result, Other}
+    end.
+
+finalize_scheduler_location_result(Address, {Event, Res}) ->
+    ?event(scheduler_location, {Event, {address, Address}, {res, Res}}),
+    Res.
+
+fallback_location(Address, Opts) ->
+    case hb_sched_loc_store:get_meta(Address) of
+        {ok, Meta} ->
+            case scheduler_location_from_meta(Address, Meta) of
+                undefined -> fallback_from_config(Address, Opts);
+                Location -> {fallback_from_sched_loc_store, {ok, Location}}
+            end;
+        _ -> fallback_from_config(Address, Opts)
+    end.
+
+fallback_from_config(Address, Opts) ->
+    Url = normalize_fallback_url(hb_opts:get(scheduler_local_fallback_url, undefined, Opts)),
+    case Url of
+        undefined -> {not_found_in_store, not_found};
+        _ ->
+            Location = build_scheduler_location(Address, Url, undefined),
+            {fallback_from_config, {ok, Location}}
+    end.
+
+scheduler_location_from_meta(Address, Meta) ->
+    case maps:get(url, Meta, undefined) of
+        Url when is_binary(Url), Url =/= <<>> ->
+            TTL = maps:get(ttl, Meta, undefined),
+            build_scheduler_location(Address, Url, TTL);
+        _ -> undefined
+    end.
+
+safe_human_id(Value) when is_binary(Value); is_list(Value) ->
+    try hb_util:human_id(Value)
+    catch _:_ -> undefined
+    end;
+safe_human_id(_) -> undefined.
+
+normalize_fallback_url(undefined) -> fallback_default_url();
+normalize_fallback_url(Url) when is_binary(Url), Url =/= <<>> -> Url;
+normalize_fallback_url(_) -> fallback_default_url().
+
+fallback_default_url() -> <<"http://127.0.0.1:6363">>.
+
+build_scheduler_location(Address, Url, TTL) ->
+    Base = #{
+        <<"data-protocol">> => <<"ao">>,
+        <<"variant">> => <<"ao.N.1">>,
+        <<"type">> => <<"scheduler-location">>,
+        <<"address">> => hb_util:bin(Address),
+        <<"url">> => hb_util:bin(Url)
+    },
+    case normalize_ttl_value(TTL) of
+        undefined -> Base;
+        Value -> Base#{ <<"time-to-live">> => Value }
+    end.
+
+normalize_ttl_value(undefined) -> undefined;
+normalize_ttl_value(Value) when is_integer(Value), Value > 0 -> hb_util:bin(Value);
+normalize_ttl_value(Value) when is_binary(Value), Value =/= <<>> -> Value;
+normalize_ttl_value(_) -> undefined.
+
+is_http_status_404(undefined) -> false;
+is_http_status_404(404) -> true;
+is_http_status_404(Value) when is_integer(Value) -> Value =:= 404;
+is_http_status_404(Value) when is_binary(Value) ->
+    case catch binary_to_integer(Value) of
+        404 -> true;
+        _ -> false
+    end;
+is_http_status_404(_) -> false.
 
 %%% Tests
 
