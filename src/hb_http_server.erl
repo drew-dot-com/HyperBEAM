@@ -317,8 +317,18 @@ start_http2(ServerID, ProtoOpts, NodeMsg) ->
 %% @doc Entrypoint for all HTTP requests. Receives the Cowboy request option and
 %% the server ID, which can be used to lookup the node message.
 init(Req, ServerID) ->
-    case cowboy_req:method(Req) of
-        <<"OPTIONS">> -> cors_reply(Req, ServerID);
+    % DrewGle: early guard for scheduler location GET
+    Method0 = cowboy_req:method(Req),
+    Path0 = cowboy_req:path(Req),
+    case {Method0, Path0} of
+        {<<"GET">>, <<"/~scheduler@1.0/location", _/binary>>} ->
+            Body404 = <<"{\"status\":404,\"error\":\"scheduler-location not found\"}">>,
+            Req2 = cowboy_req:reply(404, #{
+                <<"content-type">> => <<"application/json">>,
+                <<"access-control-allow-origin">> => <<"*">>
+            }, Body404, Req),
+            {ok, Req2, no_state};
+        {<<"OPTIONS">>, _} -> cors_reply(Req, ServerID);
         _ ->
             {ok, Body} = read_body(Req),
             handle_request(Req, Body, ServerID)

@@ -215,6 +215,17 @@ adopt_node_message(Request, NodeMsg) ->
 %% After execution, we run the node's `response' hook on the result of
 %% the request before returning the result it grants back to the user.
 handle_resolve(Req, Msgs, NodeMsg) ->
+    Opts0 = hb_http_server:get_opts(NodeMsg),
+    Path0 = hb_ao:get(<<"path">>, Req, <<>> , Opts0),
+    Method0 = hb_ao:get(<<"method">>, Req, <<"GET">>, Opts0),
+    case {Path0, Method0} of
+        {<<"/~scheduler@1.0/location", _/binary>>, <<"GET">>} ->
+            dev_scheduler:get_location(Req, Req, Opts0);
+        _ ->
+            do_handle_resolve(Req, Msgs, NodeMsg)
+    end.
+
+do_handle_resolve(Req, Msgs, NodeMsg) ->
     TracePID = hb_opts:get(trace, no_tracer_set, NodeMsg),
     % Apply the pre-processor to the request.
     ?event(http_request,

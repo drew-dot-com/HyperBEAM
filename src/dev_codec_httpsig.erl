@@ -7,6 +7,10 @@
 -module(dev_codec_httpsig).
 %%% Codec API functions
 -export([to/3, from/3]).
+%% Back-compat wrappers for older call sites
+-export([to/1, from/1]).
+%% Provide id/3 to satisfy id resolver expectations
+-export([id/3]).
 %%% Uni-directional codec support (_to_ binary/header+body components), but not 
 %%% back.
 -export([serialize/2, serialize/3]).
@@ -20,6 +24,12 @@
 %%% Routing functions for the `dev_codec_httpsig_conv' module
 to(Msg, Req, Opts) -> dev_codec_httpsig_conv:to(Msg, Req, Opts).
 from(Msg, Req, Opts) -> dev_codec_httpsig_conv:from(Msg, Req, Opts).
+%% Backward-compatible wrappers (older HB calls to/1, from/1)
+ to(Msg) -> to(Msg, #{}, #{}).
+ from(Msg) -> from(Msg, #{}, #{}).
+ 
+ %% Minimal id resolver to avoid missing-function errors in older HB flows
+ id(_Msg, _Req, _Opts) -> undefined.
 
 %% @doc Generate the `Opts' to use during AO-Core operations in the codec.
 opts(RawOpts) ->
