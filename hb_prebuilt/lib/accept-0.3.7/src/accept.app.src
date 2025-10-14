@@ -1,0 +1,10 @@
+{application,accept,
+             [{description,"Accept header(s) for Erlang/Elixir"},
+              {vsn,"0.3.7"},
+              {registered,[]},
+              {applications,[kernel,stdlib]},
+              {env,[]},
+              {modules,[]},
+              {licenses,["MIT"]},
+              {links,[{"Github",
+                       "https://github.com/prometheus-erl/accept"}]}]}.

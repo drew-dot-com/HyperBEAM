@@ -42,6 +42,7 @@
 from(Bin, _Req, _Opts) when is_binary(Bin) -> {ok, Bin};
 from(Link, _Req, _Opts) when ?IS_LINK(Link) -> {ok, Link};
 from(HTTP, _Req, Opts) ->
+    try
     % First, parse all headers excluding the signature-related headers, as they
     % are handled separately.
     Headers = hb_maps:without([<<"body">>], HTTP, Opts),
@@ -91,7 +92,11 @@ from(HTTP, _Req, Opts) ->
             Opts
         ),
     ?event({message_without_commitments, Res, Removed}),
-    {ok, Res}.
+    {ok, Res}
+  catch Class:Reason:Stack ->
+    ?event(debug_httpsig, {from_exception, {class, Class}, {reason, Reason}, {stack, Stack}, {http, HTTP}}),
+    erlang:error({httpsig_from_exception, Class, Reason})
+  end.
 
 %% @doc Generate the body TABM from the `body' key of the encoded message.
 body_to_tabm(HTTP, Opts) ->

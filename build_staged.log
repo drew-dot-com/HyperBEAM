@@ -1,0 +1,31 @@
+[staged] 2025-10-11T23:32:45Z start
+[update] 0:00.78 117432KB
+===> Verifying dependencies...
+b64fast (locked git source 58f0502...)
+cowboy (locked pkg source)
+cowlib (locked pkg source)
+elmdb* (locked git source 90c8857... <> git source feat/match)
+graphql (locked pkg source)
+gun (locked pkg source)
+luerl (locked pkg source)
+prometheus (locked pkg source)
+prometheus_cowboy (locked pkg source)
+prometheus_httpd (locked pkg source)
+ranch (locked pkg source)
+
+[deps] 0:00.68 98536KB
+===> Verifying dependencies...
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.08s
+===>   Copying libdev_snp_nif to /home/ubuntu/HyperBEAM/priv/crates/dev_snp_nif/dev_snp_nif.so...
+make: Entering directory '/home/ubuntu/HyperBEAM'
+make: Nothing to be done for 'wamr'.
+make: Leaving directory '/home/ubuntu/HyperBEAM'
+===> Analyzing applications...
+===> Compiling hb
+===> Compiling src/dev_scheduler.erl failed
+src/dev_scheduler.erl:2:13: syntax error before: PostMsg1
+
+src/dev_scheduler.erl:18:1: no module definition
+
+Command exited with non-zero status 1
+[compile] 0:00.85 99204KB

@@ -1,0 +1,17 @@
+# --- builder ---
+FROM ubuntu:22.04 AS builder
+RUN apt-get update && apt-get install -y build-essential git erlang rebar3 cmake clang llvm pkg-config libssl-dev ccache
+ENV CC="ccache gcc" CXX="ccache g++" MAKEFLAGS="-j4" ERL_FLAGS="+S 4:4"
+WORKDIR /src
+COPY . .
+RUN rebar3 clean && rebar3 update && rebar3 deps && REBAR_OFFLINE=1 rebar3 compile && rebar3 release
+
+# --- runtime ---
+FROM debian:bookworm-slim
+RUN useradd -r -s /sbin/nologin hb && mkdir -p /app/HyperBEAM /var/lib/hb && chown -R hb:hb /var/lib/hb
+COPY --from=builder /src/_build/default/rel/hb /opt/hb
+ENV HB_CONFIG_LOCATION=/app/HyperBEAM/config.flat HB_STATE_DIR=/var/lib/hb
+EXPOSE 8080
+USER hb
+ENTRYPOINT ["/opt/hb/bin/hb"]
+CMD ["foreground"]

@@ -13,13 +13,9 @@
 %% to the cache.
 opts(Opts) ->
     Opts#{
-        store =>
-            hb_opts:get(
-                scheduler_store,
-                hb_opts:get(store, no_viable_store, Opts),
-                Opts
-            )
+        store => [#{ <<"store-module">> => hb_store_fs, <<"name">> => <<"cache-mainnet">> }]
     }.
+
 
 %% @doc Write an assignment message into the cache.
 write(RawAssignment, RawOpts) ->

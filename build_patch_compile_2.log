@@ -1,0 +1,15 @@
+===> Verifying dependencies...
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.09s
+===>   Copying libdev_snp_nif to /home/ubuntu/HyperBEAM/priv/crates/dev_snp_nif/dev_snp_nif.so...
+make: Entering directory '/home/ubuntu/HyperBEAM'
+make: Nothing to be done for 'wamr'.
+make: Leaving directory '/home/ubuntu/HyperBEAM'
+===> Analyzing applications...
+===> Compiling hb
+===> Compiling src/dev_scheduler.erl failed
+src/dev_scheduler.erl:1134:6: syntax error before: ':'
+
+src/dev_scheduler.erl:1113:5: function remote_slot/4 undefined
+
+src/dev_scheduler.erl:2220:1: Warning: function http_post_legacy_schedule_test_disabled/0 is unused
+

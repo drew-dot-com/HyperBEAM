@@ -1,0 +1,16 @@
+===> Verifying dependencies...
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.09s
+===>   Copying libdev_snp_nif to /home/ubuntu/HyperBEAM/priv/crates/dev_snp_nif/dev_snp_nif.so...
+make: Entering directory '/home/ubuntu/HyperBEAM'
+make: Nothing to be done for 'wamr'.
+make: Leaving directory '/home/ubuntu/HyperBEAM'
+===> Analyzing applications...
+===> Compiling hb
+===> Compiling src/dev_scheduler.erl failed
+src/dev_scheduler.erl:1165:57: variable 'Redirect' is unbound
+src/dev_scheduler.erl:1170:25: variable 'LocalAssignments' is unbound
+src/dev_scheduler.erl:1171:25: variable 'From' is unbound
+src/dev_scheduler.erl:1172:25: variable 'To' is unbound
+
+src/dev_scheduler.erl:2217:1: Warning: function http_post_legacy_schedule_test_disabled/0 is unused
+

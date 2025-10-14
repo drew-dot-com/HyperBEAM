@@ -20,7 +20,7 @@
 %%% Local scheduling functions:
 -export([schedule/3, router/4, location/3]).
 %%% CU-flow functions:
--export([slot/3, status/3, next/3]).
+-export([slot/3, status/3, next/3, get_location/3, post_location/3]).
 -export([start/0, checkpoint/1]).
 %%% Utility functions:
 -export([parse_schedulers/1]).
@@ -383,21 +383,33 @@ get_location(_Msg1, Req, Opts) ->
             Opts
         ),
     % Search for the location of the scheduler in the scheduler-location cache.
+    % Fallback: read from FS store if primary lookup misses.
     case dev_scheduler_cache:read_location(Address, Opts) of
         not_found ->
-            {ok,
-                #{
-                    <<"status">> => 404,
-                    <<"body">> =>
-                        <<"No location found for address: ", Address/binary>>
-                }
-            };
+            FSStore = [#{ <<"store-module">> => hb_store_fs, <<"name">> => <<"cache-mainnet">> }],
+            case dev_scheduler_cache:read_location(Address, #{ store => FSStore }) of
+                {ok, Location} -> {ok, #{ <<"body">> => Location }};
+                not_found ->
+                    {ok,
+                        #{
+                            <<"status">> => 404,
+                            <<"body">> => <<"No location found for address: ", Address/binary>>
+                        }
+                    }
+            end;
         {ok, Location} -> {ok, #{ <<"body">> => Location }}
     end.
-
-%% @doc Generate a new scheduler location record and register it. We both send 
-%% the new scheduler-location to the given registry, and return it to the caller.
 post_location(Msg1, RawReq, RawOpts) ->
+  try post_location_do(Msg1, RawReq, RawOpts)
+  catch Class:Reason:Stack ->
+    ?event(scheduler_location, {post_location_exception, {class, Class}, {reason, Reason}, {stack, Stack}}),
+    {error, #{ <<"status">> => 500,
+               <<"body">> => <<"post_location exception">>,
+               <<"class">> => list_to_binary(io_lib:format("~p", [Class])),
+               <<"reason">> => list_to_binary(io_lib:format("~p", [Reason])) }}
+  end.
+
+post_location_do(Msg1, RawReq, RawOpts) ->
     Opts =
         case dev_whois:ensure_host(RawOpts) of
             {ok, NewOpts} -> NewOpts;

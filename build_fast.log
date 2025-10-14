@@ -1,0 +1,19 @@
+[staged] 2025-09-21T20:28:47Z start
+[update] 0:15.41 109508KB
+===> Verifying dependencies...
+Command terminated by signal 9
+[release] 7:15.11 36599376KB
+[fast] 2025-09-21T19:42:31Z done
+Command terminated by signal 9
+[deps] 16:37.24 61009192KB
+/usr/bin/time: cannot run REBAR_OFFLINE=1: No such file or directory
+Command exited with non-zero status 127
+[compile] 0:00.00 768KB
+===> Verifying dependencies...
+Command terminated by signal 9
+[release] 16:58.71 32716592KB
+[staged] 2025-09-21T20:12:55Z done
+Command terminated by signal 9
+[deps] 17:41.40 62588120KB
+[compile] 0:00.00 3456KB
+===> Verifying dependencies...

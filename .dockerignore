@@ -1,0 +1,13 @@
+_build
+releases
+erts-*
+deps
+.cache
+.config
+.git
+*.log
+*.dump
+*.pid
+cache-mainnet
+genesis-wasm-server
+_build.backup*

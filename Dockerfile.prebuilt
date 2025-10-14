@@ -1,0 +1,8 @@
+FROM debian:bookworm-slim
+RUN apt-get update && apt-get install -y     libssl3 ca-certificates libstdc++6 curl  && useradd -r -s /sbin/nologin hb  && mkdir -p /opt/hb /var/lib/hb /app/HyperBEAM  && chown -R hb:hb /opt/hb /var/lib/hb /app/HyperBEAM  && rm -rf /var/lib/apt/lists/*
+COPY hb_prebuilt/ /opt/hb/
+ENV HB_CONFIG_LOCATION=/app/HyperBEAM/config.flat     HB_STATE_DIR=/var/lib/hb
+EXPOSE 8080
+USER hb
+ENTRYPOINT ["/opt/hb/bin/hb"]
+CMD ["foreground"]

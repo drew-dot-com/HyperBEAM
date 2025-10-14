@@ -65,7 +65,18 @@ verify(Base, Req, RawOpts) ->
     {ok, EncMsg, EncComm, _} = normalize_for_encoding(Base, Req, Opts),
     SigBase = signature_base(EncMsg, EncComm, Opts),
     KeyRes = dev_codec_httpsig_keyid:req_to_key_material(Req, Opts),
-    RawSignature = hb_util:decode(Signature = maps:get(<<"signature">>, Req)),
+    SigField = maps:get(<<"signature">>, Req),
+    Signature = case SigField of
+        Bin when is_binary(Bin) ->
+            case binary:split(Bin, <<":">>, [global]) of
+                [<<"sig=">>, Middle, <<>>] -> Middle;
+                [_, Middle, <<>>] -> Middle;
+                [_, Middle] -> Middle;
+                _ -> Bin
+            end;
+        Other -> Other
+    end,
+    RawSignature = hb_util:decode(Signature),
     ?event(debug_httpsig,
         {
             httpsig_verifying,

@@ -58,7 +58,17 @@ commitment_to_sf_siginfo(Msg, Commitment, Opts) ->
     % `keyid' in the `signature-input' keys.
     KeyID = maps:get(<<"keyid">>, Commitment, <<>>),
     % Extract the signature from the commitment.
-    Signature = hb_util:decode(maps:get(<<"signature">>, Commitment)),
+    SigField = maps:get(<<"signature">>, Commitment),
+    Signature = case SigField of
+        Bin when is_binary(Bin) ->
+            case binary:split(Bin, <<":">>, [global]) of
+                [<<"sig=">>, Middle, <<>>] -> hb_util:decode(Middle);
+                [_, Middle, <<>>] -> hb_util:decode(Middle);
+                [_, Middle] -> hb_util:decode(Middle);
+                _ -> hb_util:decode(Bin)
+            end;
+        Other -> hb_util:decode(Other)
+    end,
     % Extract the keys present in the commitment.
     CommittedKeys = to_siginfo_keys(Msg, Commitment, Opts),
     ?event({normalized_for_enc, CommittedKeys, {commitment, Commitment}}),

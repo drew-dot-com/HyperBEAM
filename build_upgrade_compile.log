@@ -1,0 +1,18 @@
+===> Verifying dependencies...
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.11s
+===>   Copying libdev_snp_nif to /home/ubuntu/HyperBEAM/priv/crates/dev_snp_nif/dev_snp_nif.so...
+make: Entering directory '/home/ubuntu/HyperBEAM'
+make: Nothing to be done for 'wamr'.
+make: Leaving directory '/home/ubuntu/HyperBEAM'
+===> Analyzing applications...
+===> Compiling hb
+===> Compiling native/hb_beamr/hb_beamr.c
+===> Compiling native/hb_beamr/hb_wasm.c
+===> Compiling native/hb_beamr/hb_driver.c
+===> Compiling native/hb_beamr/hb_helpers.c
+===> Compiling native/hb_beamr/hb_logging.c
+===> Compiling native/hb_keccak/hb_keccak.c
+===> Compiling native/hb_keccak/hb_keccak_nif.c
+===> Linking /home/ubuntu/HyperBEAM/priv/hb_beamr.so
+===> Linking /home/ubuntu/HyperBEAM/priv/hb_keccak.so
+Post-compile hooks executed
