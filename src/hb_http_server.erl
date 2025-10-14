@@ -380,13 +380,22 @@ handle_request(RawReq, Body, ServerID) ->
                     {cowboy_req, {explicit, Req}, {body, {string, Body}}}
                 }
             ),
-            TracePID = hb_tracer:start_trace(),
+            TracePID = hb_opts:get(trace, no_tracer_set, NodeMsg),
             % Parse the HTTP request into HyerBEAM's message format.
             ReqSingleton =
                 try hb_http:req_to_tabm_singleton(Req, Body, NodeMsg)
                 catch ParseError:ParseDetails:ParseStacktrace ->
                     {parse_error, ParseError, ParseDetails, ParseStacktrace}
                 end,
+                        case {cowboy_req:path(RawReq), cowboy_req:method(RawReq)} of
+                {<<"/~scheduler.0/location">>, Meth} when Meth =:= <<"GET">> orelse Meth =:= <<"HEAD">> ->
+                    try
+                        {ok, LocationRes} = dev_scheduler:get_location(#{}, ReqSingleton, NodeMsg),
+                        hb_http:reply(Req, ReqSingleton, LocationRes, NodeMsg)
+                    catch C:E:S ->
+                        handle_error(Req, ReqSingleton, C, E, S, NodeMsg)
+                    end;
+                _ ->
             try 
                 case ReqSingleton of
                     {parse_error, PType, PDetails, PStacktrace} ->
@@ -422,6 +431,7 @@ handle_request(RawReq, Body, ServerID) ->
                         Stacktrace,
                         NodeMsg
                     )
+            end
             end
     end.
 
