@@ -154,12 +154,7 @@ read_location(Address, RawOpts) ->
             hb_store:path(hb_opts:get(store, no_viable_store, Opts), [
                 ?SCHEDULER_CACHE_PREFIX,
                 "locations",
-                (case catch binary:split(Address, <<":">>) of
-                    [<<"publickey">>, Key] ->
-                        (catch hb_util:human_id(ar_wallet:to_address(hb_util:decode(Key))));
-                    [<<"arweave">>, A] -> hb_util:human_id(A);
-                    _ -> hb_util:human_id(Address)
-                end)
+                hb_util:human_id(Address)
             ]),
             Opts
         ),

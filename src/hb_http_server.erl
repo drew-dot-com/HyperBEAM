@@ -317,8 +317,19 @@ start_http2(ServerID, ProtoOpts, NodeMsg) ->
 %% @doc Entrypoint for all HTTP requests. Receives the Cowboy request option and
 %% the server ID, which can be used to lookup the node message.
 init(Req, ServerID) ->
-    case cowboy_req:method(Req) of
-        <<"OPTIONS">> -> cors_reply(Req, ServerID);
+    % DrewGle: early guard for scheduler location GET
+    Method0 = cowboy_req:method(Req),
+    Path0 = cowboy_req:path(Req),
+    case {Method0, Path0} of
+        {<<"GET">>, <<"/~scheduler@1.0/location", _/binary>>} ->
+            % Serve minimal 404 and bypass device pipeline entirely
+            Body404 = <<"{\"status\":404,\"error\":\"scheduler-location not found\"}">>,
+            Req2 = cowboy_req:reply(404, #{
+                <<"content-type">> => <<"application/json">>,
+                <<"access-control-allow-origin">> => <<"*">>
+            }, Body404, Req),
+            {ok, Req2, no_state};
+        {<<"OPTIONS">>, _} -> cors_reply(Req, ServerID);
         _ ->
             {ok, Body} = read_body(Req),
             handle_request(Req, Body, ServerID)
@@ -371,6 +382,12 @@ handle_request(RawReq, Body, ServerID) ->
                 RawReq
             ),
             {ok, Req2, no_state};
+        {<<"/~scheduler@1.0/location">>, _QS} ->
+            % Directly serve scheduler location; avoid pipeline
+            ?event(http, {scheduler_location_route, {qs, cowboy_req:qs(RawReq)}}),
+            ReqSingleton = hb_http:req_to_tabm_singleton(Req, Body, NodeMsg),
+            {ok, LocRes} = dev_scheduler:get_location(ReqSingleton, ReqSingleton, NodeMsg),
+            hb_http:reply(Req, ReqSingleton, LocRes, NodeMsg);
         _ ->
             % The request is of normal AO-Core form, so we parse it and invoke
             % the meta@1.0 device to handle it.
@@ -400,7 +417,17 @@ handle_request(RawReq, Body, ServerID) ->
                         {accept_codec, CommitmentCodec}},
                     #{}
                 ),
-                % Invoke the meta@1.0 device to handle the request.
+                % Invoke the meta@1.0 device to handle the request.                % DrewGle: short-circuit scheduler location GET to avoid device pipeline
+                Path0 = hb_ao:get(<<"path">>, ReqSingleton, <<>>, NodeMsg),
+                Method0 = hb_ao:get(<<"method">>, ReqSingleton, <<"GET">>, NodeMsg),
+                case {Path0, Method0} of
+                    {<<"/~scheduler@1.0/location", _/binary>>, <<"GET">>} ->
+                        {ok, LocRes} = dev_scheduler:get_location(ReqSingleton, ReqSingleton, NodeMsg),
+                        hb_http:reply(Req, ReqSingleton, LocRes, NodeMsg);
+                    _ ->
+                        ok
+                end,
+
                 {ok, Res} =
                     dev_meta:handle(
                         NodeMsg#{

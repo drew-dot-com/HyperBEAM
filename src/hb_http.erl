@@ -616,22 +616,31 @@ encode_reply(Status, TABMReq, Message, Opts) ->
                     {bundle, AcceptBundle}
                 }
             ),
-            {ok, ErrMsg} =
-                dev_hyperbuddy:return_error(Message, Opts),
-            {ok,
-                maps:without([<<"body">>], ErrMsg),
-                maps:get(<<"body">>, ErrMsg, <<>>)
-            };
+            try dev_hyperbuddy:return_error(Message, Opts) of
+                {ok, ErrMsg} ->
+                    {ok,
+                        maps:without([<<"body">>], ErrMsg),
+                        maps:get(<<"body">>, ErrMsg, <<>> )
+                    };
+                {error, not_found} ->
+                    {ok, maps:without([<<"body">>], Message), <<"not_found">>}
+            catch
+                _Class:_Reason ->
+                    {ok, maps:without([<<"body">>], Message), <<"internal_error">>}
+            end;
         {404, <<"httpsig@1.0">>, false} ->
-            {ok, ErrMsg} =
-                dev_hyperbuddy:return_file(
-                    <<"hyperbuddy@1.0">>,
-                    <<"404.html">>
-                ),
-            {ok,
-                maps:without([<<"body">>], ErrMsg),
-                maps:get(<<"body">>, ErrMsg, <<>>)
-            };
+            try dev_hyperbuddy:return_file(<<"hyperbuddy@1.0">>, <<"404.html">>) of
+                {ok, ErrMsg} ->
+                    {ok,
+                        maps:without([<<"body">>], ErrMsg),
+                        maps:get(<<"body">>, ErrMsg, <<>> )
+                    };
+                {error, not_found} ->
+                    {ok, maps:without([<<"body">>], Message), <<"not_found">>}
+            catch
+                _Class:_Reason ->
+                    {ok, maps:without([<<"body">>], Message), <<"not_found">>}
+            end;
         {_, <<"httpsig@1.0">>, _} ->
             TABM =
                 hb_message:convert(
