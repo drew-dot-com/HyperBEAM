@@ -18,7 +18,7 @@
 -include_lib("eunit/include/eunit.hrl").
 
 %%% Routing functions for the `dev_codec_httpsig_conv' module
-to(Msg, Req, Opts) -> dev_codec_httpsig_conv:to(Msg, Req, Opts).
+to(Msg, _Req, _Opts) -> {ok, dev_codec_httpsig_conv:to(Msg)}.
 from(Msg, _Req, _Opts) -> {ok, dev_codec_httpsig_conv:from(Msg)}.
 
 %% @doc Generate the `Opts' to use during AO-Core operations in the codec.
