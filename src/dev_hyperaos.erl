@@ -1,5 +1,5 @@
 %%% @doc A device that renders a REPL-like interface for AO-Core via HTML.
--module(dev_hyperbuddy).
+-module(dev_hyperaos).
 -export([info/0, format/3, return_file/2, return_error/2]).
 -export([metrics/3, events/3]).
 -export([throw/3]).
@@ -13,6 +13,7 @@ info() ->
         routes => #{
             % Default message viewer page:
             <<"index">> => <<"index.html">>,
+            <<"status">> => <<"status.html">>,
             % HyperBEAM default homepage:
             <<"dashboard">> => <<"dashboard.html">>,
             % Interactive REPL:
@@ -71,11 +72,11 @@ events(_, _Req, _Opts) ->
 %% `format` key in the `format` call. This can be achieved easily using the
 %% default key semantics:
 %% ```
-%% GET /.../~hyperbuddy@1.0/format=request
+%% GET /.../~hyperaos@1.0/format=request
 %% ```
 %% Or a list of environment components:
 %% ```
-%% GET /.../~hyperbuddy@1.0/format+list=request,node
+%% GET /.../~hyperaos@1.0/format+list=request,node
 %% ```
 %% Valid components are `base`, `request`, and `node`. The string `all` can also
 %% be used to quickly include all of the components.
@@ -83,7 +84,7 @@ events(_, _Req, _Opts) ->
 %% The `truncate-keys` key can also be used to truncate the number of keys
 %% printed for each component. The default value is `infinity` (print all keys).
 %% ```
-%% GET /.../~hyperbuddy@1.0/format=request?truncate-keys=20
+%% GET /.../~hyperaos@1.0/format=request?truncate-keys=20
 %% ```
 format(Base, Req, Opts) ->
     % Find the scope of the environment that should be printed.
@@ -150,7 +151,7 @@ throw(_Msg, _Req, Opts) ->
 serve(<<"keys">>, M1, _M2, Opts) -> dev_message:keys(M1, Opts);
 serve(<<"set">>, M1, M2, Opts) -> dev_message:set(M1, M2, Opts);
 serve(Key, _, _, Opts) ->
-    ?event({hyperbuddy_serving, Key}),
+    ?event({hyperaos_serving, Key}),
     Routes = hb_maps:get(routes, info(), no_routes, Opts),
     case hb_maps:get(Key, Routes, undefined, Opts) of
         undefined -> {error, not_found};
@@ -159,13 +160,13 @@ serve(Key, _, _, Opts) ->
 
 %% @doc Read a file from disk and serve it as a static HTML page.
 return_file(Name) ->
-    return_file(<<"hyperbuddy@1.0">>, Name, #{}).
+    return_file(<<"hyperaos@1.0">>, Name, #{}).
 return_file(Device, Name) ->
     return_file(Device, Name, #{}).
 return_file(Device, Name, Template) ->
     Base = hb_util:bin(code:priv_dir(hb)),
     Filename = <<Base/binary, "/html/", Device/binary, "/", Name/binary >>,
-    ?event({hyperbuddy_serving, Filename}),
+    ?event({hyperaos_serving, Filename}),
     case file:read_file(Filename) of
         {ok, RawBody} ->
             Body = apply_template(RawBody, Template),
@@ -190,7 +191,7 @@ return_error(Error, Opts) when not is_map(Error) ->
     return_error(#{ <<"body">> => Error }, Opts);
 return_error(ErrorMsg, Opts) ->
     return_file(
-        <<"hyperbuddy@1.0">>,
+        <<"hyperaos@1.0">>,
         <<"500.html">>,
         #{ <<"error">> => hb_format:error(ErrorMsg, Opts) }
     ).
@@ -216,7 +217,7 @@ apply_template(Body, [{Key, Value} | Rest]) ->
 return_templated_file_test() ->
     {ok, #{ <<"body">> := Body }} =
         return_file(
-            <<"hyperbuddy@1.0">>,
+            <<"hyperaos@1.0">>,
             <<"500.html">>,
             #{
                 <<"error">> => <<"This is an error message.">>

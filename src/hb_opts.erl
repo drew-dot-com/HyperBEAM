@@ -150,6 +150,7 @@ default_message() ->
             #{<<"name">> => <<"http-auth@1.0">>, <<"module">> => dev_codec_http_auth},
             #{<<"name">> => <<"hook@1.0">>, <<"module">> => dev_hook},
             #{<<"name">> => <<"hyperbuddy@1.0">>, <<"module">> => dev_hyperbuddy},
+            #{<<"name">> => <<"hyperaos@1.0">>, <<"module">> => dev_hyperaos},
             #{<<"name">> => <<"copycat@1.0">>, <<"module">> => dev_copycat},
             #{<<"name">> => <<"json@1.0">>, <<"module">> => dev_codec_json},
             #{<<"name">> => <<"json-iface@1.0">>, <<"module">> => dev_json_iface},
