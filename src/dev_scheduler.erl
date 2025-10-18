@@ -24,6 +24,8 @@
 -export([start/0, checkpoint/1]).
 %%% Utility functions:
 -export([parse_schedulers/1]).
+%%% Process info endpoint:
+-export([processes/3]).
 %%% Test helper exports:
 -export([test_process/0]).
 -include("include/hb.hrl").
@@ -44,7 +46,7 @@ start() ->
 
 %% @doc This device uses a default_handler to route requests to the correct
 %% function.
-info() -> 
+info() ->
     #{
         exports =>
             [
@@ -54,7 +56,8 @@ info() ->
                 <<"schedule">>,
                 <<"slot">>,
                 <<"init">>,
-                <<"checkpoint">>
+                <<"checkpoint">>,
+                <<"processes">>
             ],
         excludes => [set, keys],
         default => fun router/4
@@ -559,39 +562,56 @@ post_location(Base, RawReq, RawOpts) ->
 %% scheduling a new message.
 schedule(Base, Req, Opts) ->
     ?event({resolving_schedule_request, {req, Req}, {state_msg, Base}}),
-    %% Check path first to handle /processes/:id endpoint
-    Path = hb_ao:get(<<"path">>, Req, <<"/">>, Opts),
-    case binary:split(Path, <<"/">>, [global, trim_all]) of
-        [<<"processes">>, _ProcID] ->
-            get_process_info(Base, Req, Opts);
-        _ ->
-            case hb_util:key_to_atom(hb_ao:get(<<"method">>, Req, <<"GET">>, Opts)) of
-                post -> post_schedule(Base, Req, Opts);
-                get -> get_schedule(Base, Req, Opts)
-            end
+    case hb_util:key_to_atom(hb_ao:get(<<"method">>, Req, <<"GET">>, Opts)) of
+        post -> post_schedule(Base, Req, Opts);
+        get -> get_schedule(Base, Req, Opts)
     end.
 
-get_process_info(Base, Req, Opts) ->
-    Path = hb_ao:get(<<"path">>, Req, <<"/">>, Opts),
-    case binary:split(Path, <<"/">>, [global, trim_all]) of
-        [<<"processes">>, ProcID] ->
-            ?event({get_process_info_request, ProcID}),
+%% @doc Return process info for a given process ID
+%% Supports: /~scheduler@1.0/processes/:id or /~scheduler@1.0/processes?target=:id
+processes(Base, Req, Opts) ->
+    %% Try to find process ID using standard method first (target parameter)
+    ProcID = case find_target_id(Base, Req, Opts) of
+        ID when is_binary(ID) -> hb_util:human_id(ID);
+        _ ->
+            %% Fallback: check if ID is in path-remainder or id parameter
+            case hb_ao:get(<<"id">>, Req, not_found, Opts) of
+                not_found ->
+                    %% Last resort: check path-remainder (device routing may put suffix here)
+                    case hb_ao:get(<<"path-remainder">>, Req, not_found, Opts) of
+                        not_found -> undefined;
+                        Remainder -> binary:replace(Remainder, <<"/">>, <<>>, [global])
+                    end;
+                IDParam -> hb_util:human_id(IDParam)
+            end
+    end,
+
+    case ProcID of
+        undefined ->
+            {error, #{
+                <<"status">> => 400,
+                <<"body">> => <<"Missing process ID - use ?target=ProcessID">>
+            }};
+        _ ->
             case dev_scheduler_registry:find(ProcID) of
                 not_found ->
-                    hb_http:not_found(Base, Req, Opts);
+                    {error, #{
+                        <<"status">> => 404,
+                        <<"body">> => <<"Process not found">>
+                    }};
                 ProcessPid when is_pid(ProcessPid) ->
-                    ProcessInfo = #{
-                        <<"owner">> => hb:address(),
+                    {ok, #{
+                        <<"owner">> => #{
+                            <<"address">> => hb:address(),
+                            <<"key">> => <<>>
+                        },
                         <<"tags">> => [],
                         <<"block">> => #{
                             <<"height">> => 0,
                             <<"timestamp">> => erlang:system_time(millisecond)
                         }
-                    },
-                    hb_http:respond(Base, Req, ProcessInfo, Opts)
-            end;
-        _ ->
-            hb_http:not_found(Base, Req, Opts)
+                    }}
+            end
     end.
 
 %% @doc Schedules a new message on the SU. Searches Base for the appropriate ID,
