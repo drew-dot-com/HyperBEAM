@@ -13,6 +13,7 @@
 
 start(_StartType, _StartArgs) ->
     hb:init(),
+    hb_sched_loc_store:init(),
     hb_sup:start_link(),
     ok = dev_scheduler_registry:start(),
     _TimestampServer = ar_timestamp:start(),
