@@ -559,9 +559,39 @@ post_location(Base, RawReq, RawOpts) ->
 %% scheduling a new message.
 schedule(Base, Req, Opts) ->
     ?event({resolving_schedule_request, {req, Req}, {state_msg, Base}}),
-    case hb_util:key_to_atom(hb_ao:get(<<"method">>, Req, <<"GET">>, Opts)) of
-        post -> post_schedule(Base, Req, Opts);
-        get -> get_schedule(Base, Req, Opts)
+    %% Check path first to handle /processes/:id endpoint
+    Path = hb_ao:get(<<"path">>, Req, <<"/">>, Opts),
+    case binary:split(Path, <<"/">>, [global, trim_all]) of
+        [<<"processes">>, _ProcID] ->
+            get_process_info(Base, Req, Opts);
+        _ ->
+            case hb_util:key_to_atom(hb_ao:get(<<"method">>, Req, <<"GET">>, Opts)) of
+                post -> post_schedule(Base, Req, Opts);
+                get -> get_schedule(Base, Req, Opts)
+            end
+    end.
+
+get_process_info(Base, Req, Opts) ->
+    Path = hb_ao:get(<<"path">>, Req, <<"/">>, Opts),
+    case binary:split(Path, <<"/">>, [global, trim_all]) of
+        [<<"processes">>, ProcID] ->
+            ?event({get_process_info_request, ProcID}),
+            case dev_scheduler_registry:find(ProcID) of
+                not_found ->
+                    hb_http:not_found(Base, Req, Opts);
+                ProcessPid when is_pid(ProcessPid) ->
+                    ProcessInfo = #{
+                        <<"owner">> => hb:address(),
+                        <<"tags">> => [],
+                        <<"block">> => #{
+                            <<"height">> => 0,
+                            <<"timestamp">> => erlang:system_time(millisecond)
+                        }
+                    },
+                    hb_http:respond(Base, Req, ProcessInfo, Opts)
+            end;
+        _ ->
+            hb_http:not_found(Base, Req, Opts)
     end.
 
 %% @doc Schedules a new message on the SU. Searches Base for the appropriate ID,
