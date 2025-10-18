@@ -45,4 +45,5 @@ mkdocs-site-manifest.csv
 
 !test/admissible-report-wallet.json
 !test/admissible-report.json
-!test/config.json
+!test/config.json*.pem
+operator_pkcs8.pem
