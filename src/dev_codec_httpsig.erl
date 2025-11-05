@@ -436,10 +436,10 @@ signature_base(EncodedMsg, Commitment, Opts) ->
 %%
 %% See https://datatracker.ietf.org/doc/html/rfc9421#section-2.5-7.2.1
 signature_components_line(Req, Commitment, _Opts) ->
-	ComponentsLines =
+    ComponentsLines =
         lists:map(
             fun(Name) ->
-                case maps:get(Name, Req, not_found) of
+                case value_for_component(Req, Name) of
                     not_found ->
                         throw(
                             {
@@ -455,7 +455,46 @@ signature_components_line(Req, Commitment, _Opts) ->
             end,
             maps:get(<<"committed">>, Commitment)
         ),
-	iolist_to_binary(lists:join(<<"\n">>, ComponentsLines)).
+    iolist_to_binary(lists:join(<<"\n">>, ComponentsLines)).
+
+%% @doc Provide tolerant coverage for component identifiers during commit/verify.
+%% Handles host/authority variants and @path/@target-uri derivations when needed.
+value_for_component(Req, Name) ->
+    case maps:get(Name, Req, not_found) of
+        not_found ->
+            case Name of
+                <<"authority">> -> maps:get(<<"host">>, Req, not_found);
+                <<"host">> -> maps:get(<<"authority">>, Req, not_found);
+                <<"path">> ->
+                    infer_path_component(Req);
+                _ -> not_found
+            end;
+        Val -> Val
+    end.
+
+infer_path_component(Req) ->
+    case maps:get(<<"path">>, Req, not_found) of
+        P when is_binary(P) -> P;
+        P when is_list(P) ->
+            try iolist_to_binary(lists:join(<<"/">>, P)) of
+                B -> B
+            catch _:_ -> not_found end;
+        _ ->
+            case maps:get(<<"@target-uri">>, Req, not_found) of
+                URI when is_binary(URI) ->
+                    try
+                        Parsed = uri_string:parse(URI),
+                        Path = maps:get(path, Parsed, <<"/">>),
+                        Query = maps:get(query, Parsed, <<>>),
+                        case Query of
+                            <<>> -> Path;
+                            _ -> <<Path/binary, "?", Query/binary>>
+                        end
+                    catch _:_ -> not_found end;
+                _ ->
+                    maps:get(<<"@path">>, Req, not_found)
+            end
+    end.
 
 %% @doc construct the "signature-params-line" part of the signature base.
 %%

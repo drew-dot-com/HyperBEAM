@@ -619,7 +619,17 @@ post_schedule(Msg1, Msg2, Opts) ->
                     end;
                 {error, Error} ->
                     ?event({error_finding_scheduler, {error, Error}}),
-                    {error, Error}
+                    case is_discovery_case(Error) of
+                        true ->
+                            spawn(fun() -> maybe_seed_discovery(ProcID, ToSched, Opts) end),
+                            {ok, #{
+                                <<"status">> => 202,
+                                <<"retry-after">> => <<"2">>,
+                                <<"cache-control">> => <<"no-store">>,
+                                <<"body">> => <<"Scheduler discovery in progress. Retry shortly.">>
+                            }};
+                        false -> {error, Error}
+                    end
             end;
         {error, Err} ->
             {error,
@@ -631,6 +641,26 @@ post_schedule(Msg1, Msg2, Opts) ->
                 }
             }
     end.
+
+%% @doc Determine whether an error represents a transient discovery case.
+is_discovery_case(not_found) -> true;
+is_discovery_case(Err) when is_binary(Err) ->
+    Lower = hb_util:to_lower(Err),
+    (binary:match(Lower, <<"scheduler">>) =/= nomatch)
+        orelse (binary:match(Lower, <<"not found">>) =/= nomatch);
+is_discovery_case(_) -> false.
+
+%% @doc Attempt to seed scheduler-location caches in the background.
+maybe_seed_discovery(ProcID, ToSched, Opts) ->
+    ?event({seeding_scheduler_discovery, {proc_id, ProcID}}),
+    catch dev_scheduler_cache:read(ProcID, Opts),
+    % Try to nudge gateway lookup paths using any available hints.
+    _ =
+        try scheduler_location(undefined, ToSched, Opts) of
+            not_found -> ok;
+            Loc -> dev_scheduler_cache:write_location(Loc, Opts)
+        catch _:_ -> ok end,
+    ok.
 
 %% @doc Post schedule the message. `Msg2' by this point has been refined to only
 %% committed keys, and to only include the `target' message that is to be

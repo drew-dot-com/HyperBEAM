@@ -185,24 +185,33 @@ nested_map_to_string(Map) ->
 %% @doc Take a message with a `signature' and `signature-input' key pair and
 %% return a map of commitments.
 siginfo_to_commitments(
-        Msg =
-            #{
-                <<"signature">> := <<"comm-", SFSigBin/binary>>,
-                <<"signature-input">> := <<"comm-", SFSigInputBin/binary>>
-            },
+        Msg = #{ <<"signature">> := SigBin, <<"signature-input">> := SFSigInputBin },
         BodyKeys,
-        Opts) ->
-    % Parse the signature and signature-input structured-fields.
-    SFSigs = hb_structured_fields:parse_dictionary(SFSigBin),
-    SFSigsInputs = hb_structured_fields:parse_dictionary(SFSigInputBin),
-    % Group parsed signature inputs and signatures into tuple pairs by their
-    % name.
+        Opts) when is_binary(SigBin), is_binary(SFSigInputBin) ->
+    % Tolerate arbitrary signature labels: `comm-*`, `sig1`, etc.
+    % Parse dictionaries directly, regardless of any label prefixes.
+    SFSigsRaw = hb_structured_fields:parse_dictionary(strip_comm_prefix(SigBin)),
+    SFSigInputsRaw = hb_structured_fields:parse_dictionary(strip_comm_prefix(SFSigInputBin)),
+    % Index inputs by their base label (without `comm-` prefix if present).
+    InputsByBase =
+        maps:from_list(
+            lists:map(
+                fun({Label, V}) -> {base_label(Label), V} end,
+                SFSigInputsRaw
+            )
+        ),
+    % Pair signatures with matching inputs by base label.
     CommitmentSFs =
-        [
-            {SFSig, element(2, lists:keyfind(SFSigName, 1, SFSigsInputs))}
-        ||
-            {SFSigName, SFSig} <- SFSigs
-        ],
+        lists:filtermap(
+            fun({Label, SigVal}) ->
+                Base = base_label(Label),
+                case maps:get(Base, InputsByBase, not_found) of
+                    not_found -> false;
+                    InputVal -> {true, {SigVal, InputVal}}
+                end
+            end,
+            SFSigsRaw
+        ),
     % Convert each tuple into a commitment and its ID.
     CommitmentMessages =
         lists:map(
@@ -500,6 +509,17 @@ add_derived_specifiers(ComponentIdentifiers) ->
             Stripped
         )
     ).
+
+%% @doc Remove a leading `comm-` from the start of a header value if present.
+strip_comm_prefix(Bin) when is_binary(Bin) ->
+    case Bin of
+        <<"comm-", Rest/binary>> -> Rest;
+        _ -> Bin
+    end.
+
+%% @doc Normalize a label by removing the `comm-` prefix if present.
+base_label(<<"comm-", Rest/binary>>) -> Rest;
+base_label(Other) -> Other.
 
 %% @doc Remove derived specifiers from a list of component identifiers.
 remove_derived_specifiers(ComponentIdentifiers) ->

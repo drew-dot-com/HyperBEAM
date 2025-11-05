@@ -74,20 +74,29 @@ from(HTTP, _Req, Opts) ->
             true -> MsgWithoutSigs
         end,
     ?event({message_with_commitments, MsgWithSigs}),
+    % Optionally unwrap JSON-Iface envelopes and strip HTTP-only keys ahead of
+    % hashpath/id computation for AO routes.
+    MsgMaybeUnwrapped = maybe_unwrap_json_iface(MsgWithSigs, Opts),
     Res =
         hb_maps:without(
             Removed =
                 hb_maps:keys(Commitments) ++
-                [<<"content-digest">>] ++
-                case maps:get(<<"content-type">>, MsgWithSigs, undefined) of
+                [
+                    <<"content-digest">>,
+                    % HTTP-only keys that should not appear in AO messages
+                    <<"accept">>, <<"accept-codec">>, <<"accept-language">>, <<"accept-encoding">>,
+                    <<"content-device">>, <<"content-codec">>, <<"codec-device">>,
+                    <<"host">>, <<"date">>, <<"connection">>, <<"user-agent">>
+                ] ++
+                case maps:get(<<"content-type">>, MsgMaybeUnwrapped, undefined) of
                     <<"multipart/", _/binary>> -> [<<"content-type">>];
                     _ -> []
                 end ++
-                case hb_message:is_signed_key(<<"ao-body-key">>, MsgWithSigs, Opts) of
+                case hb_message:is_signed_key(<<"ao-body-key">>, MsgMaybeUnwrapped, Opts) of
                     true -> [];
                     false -> [<<"ao-body-key">>]
                 end,
-            MsgWithSigs,
+            MsgMaybeUnwrapped,
             Opts
         ),
     ?event({message_without_commitments, Res, Removed}),
@@ -195,6 +204,40 @@ body_to_parts(ContentType, Body, _Opts) ->
                 [global]
             )}
     end.
+
+%% @doc If the message declares `content-device: ~json-iface@1.0`, attempt to
+%% unwrap the inner JSON message so that AO sees the intended top-level object.
+maybe_unwrap_json_iface(Msg, Opts) ->
+    case hb_maps:get(<<"content-device">>, Msg, undefined, Opts) of
+        <<"~json-iface@1.0">> ->
+            Body = hb_maps:get(<<"body">>, Msg, <<>>, Opts),
+            case Body of
+                <<>> -> Msg;
+                _ ->
+                    try hb_json:decode(Body) of
+                        JSON when is_map(JSON) ->
+                            normalize_json_keys(JSON);
+                        _ -> Msg
+                    catch _:_ -> Msg end
+            end;
+        _ -> Msg
+    end.
+
+normalize_json_keys(Map) when is_map(Map) ->
+    lists:foldl(
+        fun({K, V}, Acc) ->
+            NK = to_lower_bin(K),
+            NV = case V of M when is_map(M) -> normalize_json_keys(M); _ -> V end,
+            Acc#{ NK => NV }
+        end,
+        #{},
+        maps:to_list(Map)
+    );
+normalize_json_keys(Other) -> Other.
+
+to_lower_bin(B) when is_binary(B) -> hb_util:to_lower(B);
+to_lower_bin(L) when is_list(L) -> hb_util:to_lower(list_to_binary(L));
+to_lower_bin(Other) -> hb_util:bin(Other).
 
 %% @doc Parse a single part of a multipart body into a TABM.
 from_body_part(InlinedKey, Part, Opts) ->
