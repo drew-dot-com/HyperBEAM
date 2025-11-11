@@ -102,7 +102,7 @@ as(RawMsg1, Msg2, Opts) ->
             Opts
         ),
     {ok,
-        hb_util:deep_merge(
+        deep_merge(
             ensure_process_key(Msg1, Opts),
             #{
                 <<"device">> =>
@@ -139,7 +139,7 @@ as(RawMsg1, Msg2, Opts) ->
 %% using infrastructure that should not be present on nodes in the future.
 default_device(Msg1, Key, Opts) ->
     NormKey = hb_ao:normalize_key(Key),
-    case {NormKey, hb_util:deep_get(<<"process/variant">>, Msg1, Opts)} of
+    case {NormKey, process_variant(Msg1, Opts)} of
         {<<"execution">>, <<"ao.TN.1">>} -> <<"genesis-wasm@1.0">>;
         _ -> default_device_index(NormKey)
     end.
@@ -694,7 +694,7 @@ run_as(Key, Msg1, Msg2, Opts) ->
     % Prepare the message with the specialized device configuration.
     % This sets up the device context for the specific operation type.
     PreparedMsg =
-        hb_util:deep_merge(
+        deep_merge(
             ensure_process_key(Msg1, Opts),
             #{
                 <<"device">> =>
@@ -751,49 +751,180 @@ as_process(Msg1, Opts) ->
 
 %% @doc Helper function to store a copy of the `process' key in the message.
 ensure_process_key(Msg1, Opts) ->
-    case hb_maps:get(<<"process">>, Msg1, not_found, Opts) of
-        not_found ->
-            % If the message has lost its signers, we need to re-read it from
-            % the cache. This can happen if the message was 'cast' to a different
-            % device, leading the signers to be unset.
-            ProcessMsg =
-                case hb_message:signers(Msg1, Opts) of
+    MaybeWithProcess =
+        case hb_maps:get(<<"process">>, Msg1, not_found, Opts) of
+            not_found ->
+                % If the message has lost its signers, we need to re-read it from
+                % the cache. This can happen if the message was 'cast' to a different
+                % device, leading the signers to be unset.
+                ProcessMsg =
+                case message_signers(Msg1, Opts) of
                     [] ->
                         ?event({process_key_not_found_no_signers, {msg1, Msg1}}),
                         case hb_cache:read(hb_message:id(Msg1, all, Opts), Opts) of
-                            {ok, Proc} -> Proc;
-                            not_found ->
-                                % Fallback to the original message if we cannot
-                                % read it from the cache.
-                                Msg1
-                        end;
-                    Signers ->
-                        ?event(
-                            {process_key_not_found_but_signers_present,
-                                {signers, Signers},
-                                {msg1, Msg1}
-                            }
-                        ),
-                        Msg1
-                end,
-            {ok, Committed} = hb_message:with_only_committed(ProcessMsg, Opts),
-            ?event(
-                {process_key_before_set,
-                    {msg1, Msg1},
-                    {process_msg, {explicit, ProcessMsg}},
-                    {committed, Committed}
-                }
-            ),
-            Res =
-                hb_ao:set(
-                    hb_message:uncommitted(Msg1, Opts),
-                    #{ <<"process">> => Committed },
-                    Opts#{ hashpath => ignore }
+                                {ok, Proc} -> Proc;
+                                not_found ->
+                                    % Fallback to the original message if we cannot
+                                    % read it from the cache.
+                                    Msg1
+                            end;
+                        Signers ->
+                            ?event(
+                                {process_key_not_found_but_signers_present,
+                                    {signers, Signers},
+                                    {msg1, Msg1}
+                                }
+                            ),
+                            Msg1
+                    end,
+                {ok, Committed0} = hb_message:with_only_committed(ProcessMsg, Opts),
+                Committed = ensure_device_stack_present(Committed0, Opts),
+                ?event(
+                    {process_key_before_set,
+                        {msg1, Msg1},
+                        {process_msg, {explicit, ProcessMsg}},
+                        {committed, Committed}
+                    }
                 ),
-            ?event({set_process_key_res, {msg1, Msg1}, {process_msg, ProcessMsg}, {res, Res}}),
-            Res;
-        _ -> Msg1
+                Res =
+                    hb_ao:set(
+                        message_uncommitted(Msg1, Opts),
+                        #{ <<"process">> => Committed },
+                        Opts#{ hashpath => ignore }
+                    ),
+                ?event({set_process_key_res, {msg1, Msg1}, {process_msg, ProcessMsg}, {res, Res}}),
+                Res;
+            _ ->
+                Msg1
+        end,
+    ensure_device_stack_present(MaybeWithProcess, Opts).
+
+ensure_device_stack_present(Msg, Opts) ->
+    case hb_maps:get(<<"device-stack">>, Msg, not_found, Opts) of
+        not_found ->
+            case execution_stack_from_message(Msg, Opts) of
+                not_found -> Msg;
+                RawStack ->
+                    case parse_execution_stack_value(RawStack) of
+                        [] -> Msg;
+                        Stack ->
+                            hb_ao:set(
+                                Msg,
+                                #{ <<"device-stack">> => Stack },
+                                Opts#{ hashpath => ignore }
+                            )
+                    end
+            end;
+        _ -> Msg
     end.
+
+execution_stack_from_message(Msg, Opts) ->
+    CandidateKeys = [
+        <<"execution-stack">>,
+        <<"Execution-Stack">>,
+        <<"execution_stack">>
+    ],
+    Keys = message_keys(Msg, Opts),
+    LowerKeyMap =
+        lists:foldl(
+            fun(Key, Acc) ->
+                case key_to_binary(Key) of
+                    undefined -> Acc;
+                    BinKey ->
+                        maps:put(
+                            string:lowercase(BinKey),
+                            Key,
+                            Acc
+                        )
+                end
+            end,
+            #{},
+            Keys
+        ),
+    find_stack_value(CandidateKeys, LowerKeyMap, Msg, Opts).
+
+find_stack_value([], _LowerKeyMap, _Msg, _Opts) ->
+    not_found;
+find_stack_value([Candidate|Rest], LowerKeyMap, Msg, Opts) ->
+    LowerCandidate = string:lowercase(key_to_binary(Candidate)),
+    case maps:find(LowerCandidate, LowerKeyMap) of
+        {ok, ActualKey} ->
+            hb_maps:get(ActualKey, Msg, not_found, Opts);
+        error ->
+            find_stack_value(Rest, LowerKeyMap, Msg, Opts)
+    end.
+
+parse_execution_stack_value(Value) when is_binary(Value) ->
+    stack_entries_from_list(binary:split(Value, <<",">>, [global]));
+parse_execution_stack_value(Value) when is_list(Value) ->
+    case hb_util:is_string_list(Value) of
+        true -> parse_execution_stack_value(list_to_binary(Value));
+        false -> stack_entries_from_list(Value)
+    end;
+parse_execution_stack_value(Value) when is_map(Value) ->
+    stack_entries_from_list(maps:values(Value));
+parse_execution_stack_value(Value) ->
+    stack_entries_from_list([Value]).
+
+stack_entries_from_list(List) when is_list(List) ->
+    lists:filtermap(fun normalize_stack_entry/1, List);
+stack_entries_from_list(_) ->
+    [].
+
+normalize_stack_entry(Entry) when is_binary(Entry) ->
+    Trimmed = string:trim(Entry),
+    case Trimmed of
+        <<>> -> false;
+        _ -> {true, Trimmed}
+    end;
+normalize_stack_entry(Entry) when is_list(Entry) ->
+    case hb_util:is_string_list(Entry) of
+        true -> normalize_stack_entry(list_to_binary(Entry));
+        false -> false
+    end;
+normalize_stack_entry(_) ->
+    false.
+
+message_signers(Msg, Opts) ->
+    case erlang:function_exported(hb_message, signers, 2) of
+        true -> hb_message:signers(Msg, Opts);
+        false -> hb_message:signers(Msg)
+    end.
+
+message_uncommitted(Msg, Opts) ->
+    case erlang:function_exported(hb_message, uncommitted, 2) of
+        true -> hb_message:uncommitted(Msg, Opts);
+        false -> hb_message:uncommitted(Msg)
+    end.
+
+message_keys(Msg, Opts) ->
+    lists:map(fun({Key, _}) -> Key end, hb_maps:to_list(Msg, Opts)).
+
+process_variant(Msg, Opts) ->
+    case erlang:function_exported(hb_util, deep_get, 3) of
+        true -> hb_util:deep_get(<<"process/variant">>, Msg, Opts);
+        false -> hb_ao:get(<<"process/variant">>, Msg, Opts)
+    end.
+
+deep_merge(Msg1, Msg2, Opts) ->
+    case erlang:function_exported(hb_util, deep_merge, 3) of
+        true -> hb_util:deep_merge(Msg1, Msg2, Opts);
+        false -> hb_maps:merge(Msg1, Msg2, Opts)
+    end.
+
+key_to_binary(Value) when is_binary(Value) ->
+    Value;
+key_to_binary(Value) when is_atom(Value) ->
+    atom_to_binary(Value, utf8);
+key_to_binary(Value) when is_integer(Value) ->
+    integer_to_binary(Value);
+key_to_binary(Value) when is_list(Value) ->
+    case hb_util:is_string_list(Value) of
+        true -> list_to_binary(Value);
+        false -> undefined
+    end;
+key_to_binary(_) ->
+    undefined.
 
 %%% Tests
 
@@ -823,7 +954,7 @@ test_wasm_process(WASMImage, Opts) ->
     #{ <<"image">> := WASMImageID } = dev_wasm:cache_wasm_image(WASMImage, Opts),
     hb_message:commit(
         hb_maps:merge(
-            hb_message:uncommitted(test_base_process(Opts), Opts),
+            message_uncommitted(test_base_process(Opts), Opts),
             #{
                 <<"execution-device">> => <<"stack@1.0">>,
                 <<"device-stack">> => [<<"wasm-64@1.0">>],
@@ -851,7 +982,7 @@ test_aos_process(Opts, Stack) ->
     WASMProc = test_wasm_process(<<"test/aos-2-pure-xs.wasm">>, Opts),
     hb_message:commit(
         hb_maps:merge(
-            hb_message:uncommitted(WASMProc, Opts),
+            message_uncommitted(WASMProc, Opts),
             #{
                 <<"device-stack">> => Stack,
                 <<"execution-device">> => <<"stack@1.0">>,
@@ -891,7 +1022,7 @@ schedule_test_message(Msg1, Text, Opts) ->
     schedule_test_message(Msg1, Text, #{}, Opts).
 schedule_test_message(Msg1, Text, MsgBase, Opts) ->
     Wallet = hb:wallet(),
-    UncommittedBase = hb_message:uncommitted(MsgBase, Opts),
+    UncommittedBase = message_uncommitted(MsgBase, Opts),
     Msg2 =
         hb_message:commit(#{
                 <<"path">> => <<"schedule">>,

@@ -153,7 +153,7 @@ request(Method, Peer, Path, RawMessage, Opts) ->
     % Merge the set-cookie message into the header map, which itself is
     % constructed from the header key-value pair list.
     HeaderMap = hb_maps:merge(hb_maps:from_list(Headers), MaybeSetCookie, Opts),
-    NormHeaderMap = hb_ao:normalize_keys(HeaderMap, Opts),
+    NormHeaderMap = normalize_keys_safe(HeaderMap, Opts),
     ?event(http_outbound,
         {normalized_response_headers, {norm_header_map, NormHeaderMap}},
         Opts
@@ -343,7 +343,7 @@ route_to_request(M, {error, Reason}, _Opts) ->
 %% preferred format. This function honors the `accept-bundle' option, if it is
 %% already present in the message, and sets it to `true' if it is not.
 prepare_request(Format, Method, Peer, Path, RawMessage, Opts) ->
-    Message = hb_ao:normalize_keys(RawMessage, Opts),
+    Message = normalize_keys_safe(RawMessage, Opts),
     % Generate a `cookie' key for the message, if an unencoded cookie is
     % present.
     {MaybeCookie, WithoutCookie} =
@@ -468,7 +468,7 @@ reply(Req, TABMReq, Message, Opts) ->
 reply(Req, TABMReq, BinStatus, RawMessage, Opts) when is_binary(BinStatus) ->
     reply(Req, TABMReq, binary_to_integer(BinStatus), RawMessage, Opts);
 reply(InitReq, TABMReq, Status, RawMessage, Opts) ->
-    KeyNormMessage = hb_ao:normalize_keys(RawMessage, Opts),
+    KeyNormMessage = normalize_keys_safe(RawMessage, Opts),
     {ok, Req, Message} = reply_handle_cookies(InitReq, KeyNormMessage, Opts),
     {ok, HeadersBeforeCors, EncodedBody} =
         encode_reply(
@@ -811,9 +811,59 @@ req_to_tabm_singleton(Req, Body, Opts) ->
             "?",
             (cowboy_req:qs(Req))/binary
         >>,
+    Method = cowboy_req:method(Req),
+    BodySize = byte_size(Body),
+    PreviewLen = erlang:min(512, BodySize),
+    Preview = base64:encode_to_string(binary:part(Body, 0, PreviewLen)),
     Headers = cowboy_req:headers(Req),
+    error_logger:warning_msg(
+        "[hb_http] incoming method=~p path=~p body_bytes=~p header_keys=~p preview_b64=~s~n",
+        [Method, FullPath, BodySize, maps:keys(Headers), Preview]
+    ),
+    ?event(http,
+        {incoming_request_preview,
+            {method, Method},
+            {path, FullPath},
+            {body_bytes, BodySize},
+            {header_keys, maps:keys(Headers)},
+            {body_preview_base64, Preview}
+        }
+    ),
     {ok, _Path, QueryKeys} = hb_singleton:from_path(FullPath),
     PrimitiveMsg = maps:merge(Headers, QueryKeys),
+    io:format("[hb_http] primitive_message=~p~n", [PrimitiveMsg]),
+    try
+        LogEntry =
+            #{
+                timestamp => erlang:system_time(millisecond),
+                method => cowboy_req:method(Req),
+                path => FullPath,
+                body_bytes => byte_size(Body),
+                header_keys => maps:keys(Headers),
+                query_keys => maps:keys(QueryKeys),
+                body_preview =>
+                    base64:encode_to_string(
+                        binary:part(
+                            Body,
+                            0,
+                            erlang:min(256, byte_size(Body))
+                        )
+                    )
+            },
+        case file:write_file(
+            "/tmp/hb_http_req.log",
+            io_lib:format("~p~n", [LogEntry]),
+            [append]
+        ) of
+            ok -> ok;
+            {error, Reason} ->
+                io:format("[hb_http] log_write_error=~p~n", [Reason])
+        end
+    catch
+        Class:CatchReason:Stacktrace ->
+            io:format("[hb_http] log_exception class=~p reason=~p stack=~p~n",
+                [Class, CatchReason, Stacktrace])
+    end,
     Codec =
         case hb_maps:find(<<"codec-device">>, PrimitiveMsg, Opts) of
             {ok, ExplicitCodec} -> ExplicitCodec;
@@ -1222,3 +1272,9 @@ index_request_test() ->
             #{}
         ),
     ?assertEqual(<<"i like dogs!">>, hb_ao:get(<<"body">>, Res, #{})).
+
+normalize_keys_safe(Message, Opts) ->
+    case erlang:function_exported(hb_ao, normalize_keys, 2) of
+        true -> hb_ao:normalize_keys(Message, Opts);
+        false -> hb_ao:normalize_keys(Message)
+    end.

@@ -305,18 +305,29 @@ load(ID, Opts) when ?IS_ID(ID) ->
 			end
 	end;
 load(ID, Opts) ->
-    NormKey =
-        case is_atom(ID) of
-            true -> ID;
-            false -> hb_ao:normalize_key(ID)
-        end,
+    NormKey = normalize_device_name(ID),
+    Preloaded = hb_opts:get(preloaded_devices, [], Opts),
     case lists:search(
-        fun (#{ <<"name">> := Name }) -> Name =:= NormKey end,
-        Preloaded = hb_opts:get(preloaded_devices, [], Opts)
+        fun (#{ <<"name">> := Name }) ->
+            normalize_device_name(Name) =:= NormKey
+        end,
+        Preloaded
     ) of
         false -> {error, {module_not_admissable, NormKey, Preloaded}};
         {value, #{ <<"module">> := Mod }} -> load(Mod, Opts)
     end.
+
+normalize_device_name(Name) ->
+    strip_device_prefix(normalize_device_value(hb_ao:normalize_key(Name))).
+
+normalize_device_value(NameBin) ->
+    Lowered = string:lowercase(NameBin),
+    binary:replace(Lowered, <<"/">>, <<"@">>, [global]).
+
+strip_device_prefix(<<"~", Rest/binary>>) ->
+    strip_device_prefix(Rest);
+strip_device_prefix(Value) when is_binary(Value) ->
+    Value.
 
 %% @doc Verify that a device is compatible with the current machine.
 verify_device_compatibility(Msg, Opts) ->

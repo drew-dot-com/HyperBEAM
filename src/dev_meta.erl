@@ -67,8 +67,9 @@ build(_, _, _NodeMsg) ->
 %% with a `Meta' key are routed to the `handle_meta/2' function, while all
 %% other messages are routed to the `handle_resolve/2' function.
 handle(NodeMsg, RawRequest) ->
-    ?event({singleton_tabm_request, RawRequest}),
+    log_debug(raw_singleton_request, RawRequest),
     NormRequest = hb_singleton:from(RawRequest, NodeMsg),
+    log_debug(normalized_request, NormRequest),
     ?event(
         http,
         {request,
@@ -89,8 +90,15 @@ handle(NodeMsg, RawRequest) ->
                     NodeMsg
                 ),
             Res;
-        _ -> handle_resolve(RawRequest, NormRequest, NodeMsg)
+        _ ->
+            log_debug(delegating_to_resolve, #{ raw => RawRequest, norm => NormRequest }),
+            handle_resolve(RawRequest, NormRequest, NodeMsg)
     end.
+
+log_debug(Tag, Data) ->
+    Timestamp = erlang:system_time(millisecond),
+    Msg = io_lib:format("[dev_meta] ~p ~p~n", [Timestamp, {Tag, Data}]),
+    file:write_file("/tmp/dev_meta.log", Msg, [append]).
 
 handle_initialize([Base = #{ <<"device">> := Dev}, Req = #{ <<"path">> := Path }|_], NodeMsg) ->
     ?event({got, {device, Dev}, {path, Path}}),
