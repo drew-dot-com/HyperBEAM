@@ -70,6 +70,9 @@
 %%% Debugging tools:
 -export([print/1]).
 -include("include/hb.hrl").
+-ifndef(IS_LINK).
+-define(IS_LINK(X), (is_tuple(X) andalso element(1, X) == link)).
+-endif.
 
 %% @doc Convert a message from one format to another. Taking a message in the
 %% source format, a target format, and a set of opts. If not given, the source
@@ -252,9 +255,26 @@ with_only_committed(Msg, Opts) when is_map(Msg) ->
                 % Add the ao-body-key to the committed list if it is not
                 % already present.
                 ?event(debug_bundle, {committed_keys, CommittedKeys, {msg, Msg}}),
+                ?event(debug_bundle,
+                    {with_only_committed_meta,
+                        {has_method, maps:is_key(<<"method">>, Msg)},
+                        {has_at_method, maps:is_key(<<"@method">>, Msg)},
+                        {has_path, maps:is_key(<<"path">>, Msg)},
+                        {has_at_path, maps:is_key(<<"@path">>, Msg)}}),
+                EssentialKeys =
+                    lists:usort(
+                        CommittedKeys ++
+                        [
+                            <<"method">>,
+                            <<"@method">>,
+                            <<"path">>,
+                            <<"@path">>,
+                            <<"@target-uri">>
+                        ]
+                    ),
                 {ok,
                     with_links(
-                        [<<"commitments">> | CommittedKeys],
+                        [<<"commitments">> | EssentialKeys],
                         Msg,
                         Opts
                     )

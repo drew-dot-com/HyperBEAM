@@ -515,49 +515,8 @@ reply(InitReq, TABMReq, Status, RawMessage, Opts) ->
 %% @doc Handle replying with cookies if the message contains them. Returns the
 %% new Cowboy `Req` object, and the message with the cookies removed. Both
 %% `set-cookie' and `cookie' fields are treated as viable sources of cookies.
-reply_handle_cookies(Req, Message, Opts) ->
-    {ok, Cookies} = dev_codec_cookie:extract(Message, #{}, Opts),
-    ?event(debug_cookie, {encoding_reply_cookies, {explicit, Cookies}}),
-    case Cookies of
-        NoCookies when map_size(NoCookies) == 0 -> {ok, Req, Message};
-        _ ->
-            % The internal values of the `cookie' field will be stored in the
-            % `priv_store' by default, so we let `dev_codec_cookie:opts/1'
-            % reset the options.
-            {ok, #{ <<"set-cookie">> := SetCookieLines }} =
-                dev_codec_cookie:to(
-                    Message,
-                    #{ <<"format">> => <<"set-cookie">> },
-                    Opts
-                ),
-            ?event(debug_cookie, {outbound_set_cookie_lines, SetCookieLines}),
-            % Add the cookies to the response headers.
-            FinalReq =
-                lists:foldl(
-                    fun(FullCookieLine, ReqAcc) ->
-                        [CookieRef, _] = binary:split(FullCookieLine, <<"=">>),
-                        RespCookies = maps:get(resp_cookies, ReqAcc, #{}),
-                        % Note: Cowboy handles cookies peculiarly. The key
-                        % given in the `resp_cookies' map is not used directly
-                        % in the response headers. Nonetheless, we use the
-                        % key parsed from the cookie line as the key, but do not
-                        % be surprised if while debugging you see a different
-                        % key created by Cowboy in the response headers.
-                        ReqAcc#{
-                            resp_cookies =>
-                                RespCookies#{ CookieRef => FullCookieLine }
-                        }
-                    end,
-                    Req,
-                    SetCookieLines
-                ),
-            {ok, CookieReset} = dev_codec_cookie:reset(Message, Opts),
-            {
-                ok,
-                FinalReq,
-                CookieReset
-            }
-    end.
+reply_handle_cookies(Req, Message, _Opts) ->
+    {ok, Req, Message}.
 
 %% @doc Add permissive CORS headers to a message, if the message has not already
 %% specified CORS headers.

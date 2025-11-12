@@ -63,7 +63,8 @@ verify(Base, Req, RawOpts) ->
     % base and validating against the signature.
     Opts = opts(RawOpts),
     {ok, EncMsg, EncComm, _} = normalize_for_encoding(Base, Req, Opts),
-    SigBase = signature_base(EncMsg, EncComm, Opts),
+    EnrichedEncMsg = ensure_signature_meta(EncMsg, Base),
+    SigBase = signature_base(EnrichedEncMsg, EncComm, Opts),
     KeyRes = dev_codec_httpsig_keyid:req_to_key_material(Req, Opts),
     RawSignature = hb_util:decode(Signature = maps:get(<<"signature">>, Req)),
     ?event(debug_httpsig,
@@ -419,6 +420,15 @@ signature_base(EncodedMsg, Commitment, Opts) ->
             Commitment,
             Opts
         ),
+    ?event(debug_httpsig,
+        {signature_base_input,
+            {has_method, maps:is_key(<<"method">>, EncodedMsg)},
+            {has_at_method, maps:is_key(<<"@method">>, EncodedMsg)},
+            {has_path, maps:is_key(<<"path">>, EncodedMsg)},
+            {has_at_path, maps:is_key(<<"@path">>, EncodedMsg)},
+            {has_target_uri, maps:is_key(<<"@target-uri">>, EncodedMsg)}
+        }
+    ),
     ?event({component_identifiers_for_sig_base, ComponentsLines}),
 	ParamsLine = signature_params_line(Commitment, Opts),
     SignatureBase = 
@@ -463,11 +473,79 @@ value_for_component(Req, Name) ->
     case maps:get(Name, Req, not_found) of
         not_found ->
             case Name of
+                <<"method">> ->
+                    ?event(debug_httpsig, {missing_component_method, maps:keys(Req)}),
+                    fallback_method_component(Req);
                 <<"authority">> -> maps:get(<<"host">>, Req, not_found);
                 <<"host">> -> maps:get(<<"authority">>, Req, not_found);
                 <<"path">> ->
                     infer_path_component(Req);
                 _ -> not_found
+        end;
+        Val -> Val
+    end.
+
+ensure_signature_meta(Msg, Base) ->
+    Result =
+    lists:foldl(
+        fun(Key, Acc) ->
+            case maps:is_key(Key, Acc) of
+                true -> Acc;
+                false ->
+                    case maps:get(Key, Base, not_found) of
+                        not_found ->
+                            case alternate_signature_meta(Key, Base) of
+                                not_found -> Acc;
+                                Value -> maps:put(Key, Value, Acc)
+                            end;
+                        Value -> maps:put(Key, Value, Acc)
+                    end
+            end
+        end,
+        Msg,
+        [<<"method">>,<<"@method">>,<<"path">>,<<"@path">>,<<"@target-uri">>]
+    ),
+    ?event(debug_httpsig,
+        {ensure_signature_meta,
+            {msg_has_method, maps:is_key(<<"method">>, Msg)},
+            {base_has_method, maps:is_key(<<"method">>, Base)},
+            {result_has_method, maps:is_key(<<"method">>, Result)},
+            {result_has_at_method, maps:is_key(<<"@method">>, Result)},
+            {result_has_path, maps:is_key(<<"path">>, Result)},
+            {result_has_target_uri, maps:is_key(<<"@target-uri">>, Result)}
+        }
+    ),
+    Result.
+
+alternate_signature_meta(<<"@method">>, Base) ->
+    hb_util:to_lower(maps:get(<<"method">>, Base, not_found));
+alternate_signature_meta(<<"method">>, Base) ->
+    maps:get(<<"@method">>, Base, not_found);
+alternate_signature_meta(<<"path">>, Base) ->
+    maps:get(<<"@path">>, Base, not_found);
+alternate_signature_meta(<<"@path">>, Base) ->
+    maps:get(<<"path">>, Base, not_found);
+alternate_signature_meta(<<"@target-uri">>, Base) ->
+    case maps:get(<<"@target-uri">>, Base, not_found) of
+        not_found ->
+            case {maps:get(<<"host">>, Base, not_found), maps:get(<<"path">>, Base, <<"/">>)} of
+                {Host, Path} when Host =/= not_found -> <<"http://", Host/binary, Path/binary>>;
+                _ -> not_found
+            end;
+        URI -> URI
+    end;
+alternate_signature_meta(_, _) -> not_found.
+
+fallback_method_component(Req) ->
+    case maps:get(<<"method">>, Req, not_found) of
+        not_found ->
+            case maps:get(<<"@method">>, Req, not_found) of
+                not_found ->
+                    case maps:get(<<"method">>, maps:get(<<"body">>, Req, #{}), not_found) of
+                        not_found -> <<"post">>;
+                        BodyVal -> BodyVal
+                    end;
+                Val -> Val
             end;
         Val -> Val
     end.

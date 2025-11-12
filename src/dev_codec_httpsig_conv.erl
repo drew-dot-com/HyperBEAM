@@ -29,6 +29,9 @@
 -export([to/3, from/3, encode_http_msg/2]).
 %%% Helper utilities
 -include("include/hb.hrl").
+-ifndef(IS_LINK).
+-define(IS_LINK(X), (is_tuple(X) andalso element(1, X) == link)).
+-endif.
 -include_lib("eunit/include/eunit.hrl").
 
 % The max header length is 4KB
@@ -41,13 +44,14 @@
 %% HTTP Structured Field is encoded into it's equivalent TABM encoding.
 from(Bin, _Req, _Opts) when is_binary(Bin) -> {ok, Bin};
 from(Link, _Req, _Opts) when ?IS_LINK(Link) -> {ok, Link};
-from(HTTP, _Req, Opts) ->
+from(HTTP, Req, Opts) ->
+    FixedHTTP = ensure_http_meta(HTTP, Req, Opts),
     % First, parse all headers excluding the signature-related headers, as they
     % are handled separately.
-    Headers = hb_maps:without([<<"body">>], HTTP, Opts),
+    Headers = hb_maps:without([<<"body">>], FixedHTTP, Opts),
     % Next, we need to potentially parse the body, get the ordering of the body
     % parts, and add them to the TABM.
-    {OrderedBodyKeys, BodyTABM} = body_to_tabm(HTTP, Opts),
+    {OrderedBodyKeys, BodyTABM} = body_to_tabm(FixedHTTP, Opts),
     % Merge the body keys with the headers.
     WithBodyKeys = maps:merge(Headers, BodyTABM),
     % Decode the `ao-ids' key into a map. `ao-ids' is an encoding of literal
@@ -101,6 +105,45 @@ from(HTTP, _Req, Opts) ->
         ),
     ?event({message_without_commitments, Res, Removed}),
     {ok, Res}.
+
+ensure_http_meta(HTTP, Req, Opts) when is_map(HTTP) ->
+    Method =
+        case Req of
+            #{ method := CowboyMethod } -> CowboyMethod;
+            _ -> hb_maps:get(<<"method">>, HTTP, <<"POST">>, Opts)
+        end,
+    LowerMethod = hb_util:to_lower(Method),
+    PathVal =
+        hb_maps:get(
+            <<"path">>,
+            HTTP,
+            case Req of
+                #{ path := CowboyPath } -> CowboyPath;
+                _ -> <<>>
+            end,
+            Opts
+        ),
+    UriVal =
+        case Req of
+            #{ uri := CowboyURI } -> CowboyURI;
+            _ ->
+                case hb_maps:get(<<"@target-uri">>, HTTP, not_found, Opts) of
+                    not_found ->
+                        case hb_maps:get(<<"host">>, HTTP, not_found, Opts) of
+                            not_found -> <<>>;
+                            Host -> <<"http://", Host/binary, PathVal/binary>>
+                        end;
+                    URI -> URI
+                end
+        end,
+    HTTP#{
+        <<"method">> => Method,
+        <<"@method">> => LowerMethod,
+        <<"path">> => PathVal,
+        <<"@path">> => PathVal,
+        <<"@target-uri">> => UriVal
+    };
+ensure_http_meta(HTTP, _Req, _Opts) -> HTTP.
 
 %% @doc Generate the body TABM from the `body' key of the encoded message.
 body_to_tabm(HTTP, Opts) ->

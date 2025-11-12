@@ -4,6 +4,9 @@
 -module(dev_codec_cookie_auth).
 -include_lib("eunit/include/eunit.hrl").
 -include("include/hb.hrl").
+-ifndef(IS_LINK).
+-define(IS_LINK(X), (is_tuple(X) andalso element(1, X) == link)).
+-endif.
 -export([commit/3, verify/3]).
 -export([generate/3, finalize/3]).
 
