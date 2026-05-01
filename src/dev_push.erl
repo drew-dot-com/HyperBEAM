@@ -7,6 +7,8 @@
 -include("include/hb.hrl").
 -include_lib("eunit/include/eunit.hrl").
 
+-define(PUSH_DELIVERED_PREFIX, <<"push-delivered/">>).
+
 %% @doc Push either a message or an assigned slot number. If a `Process' is
 %% provided in the `body' of the request, it will be scheduled (initializing
 %% it if it does not exist). Otherwise, the message specified by the given
@@ -20,7 +22,7 @@
 %%  `/push-mode':    Whether or not the push should be done asynchronously.
 %%                    Default: `sync', pushing synchronously.
 push(Base, Req, Opts) ->
-    Process = dev_process:as_process(Base, Opts),
+    Process = dev_process_lib:as_process(Base, Opts),
     ?event(push, {push_base, {base, Process}, {req, Req}}, Opts),
     case hb_ao:get(<<"slot">>, {as, <<"message@1.0">>, Req}, no_slot, Opts) of
         no_slot ->
@@ -74,9 +76,9 @@ is_async(Process, Req, Opts) ->
 %% @doc Push a message or slot number, including its downstream results.
 do_push(PrimaryProcess, Assignment, Opts) ->
     Slot = hb_ao:get(<<"slot">>, Assignment, Opts),
-    ID = dev_process:process_id(PrimaryProcess, #{}, Opts),
+    ID = dev_process_lib:process_id(PrimaryProcess, #{}, Opts),
     UncommittedID =
-        dev_process:process_id(
+        dev_process_lib:process_id(
             PrimaryProcess,
             #{ <<"commitments">> => <<"none">> },
             Opts
@@ -86,16 +88,48 @@ do_push(PrimaryProcess, Assignment, Opts) ->
         {push_computing_outbox,
             {process_id, ID},
             {base_id, BaseID},
+            {process_uncommitted_id, UncommittedID},
             {slot, Slot}
         }
     ),
     ?event(push, {push_computing_outbox, {process_id, ID}, {slot, Slot}}),
     {Status, Result} =
-        hb_ao:resolve(
-            {as, <<"process@1.0">>, PrimaryProcess},
-            #{ <<"path">> => <<"compute/results">>, <<"slot">> => Slot },
-            Opts#{ hashpath => ignore }
-        ),
+        try
+            hb_ao:resolve(
+                {as, <<"process@1.0">>, PrimaryProcess},
+                    #{ <<"path">> => <<"compute/results">>, <<"slot">> => Slot },
+                    Opts#{ hashpath => ignore }
+                )
+        catch
+            Class:Reason:Trace ->
+                ?event(
+                    push,
+                    {push_compute_failed,
+                        {process, PrimaryProcess},
+                        {slot, Slot},
+                        {class, Class},
+                        {reason, Reason},
+                        {stack, {trace, Trace}}
+                    },
+                    Opts
+                ),
+                {error,
+                    #{
+                        <<"body">> =>
+                                <<
+                                    "Pushing slot ",
+                                    (hb_util:bin(Slot))/binary,
+                                    " failed on process `",
+                                    (hb_util:bin(ID))/binary,
+                                    "` with error: ",
+                                    (hb_util:bin(hb_format:term(Reason, Opts, 0)))
+                                        /binary
+                                >>,
+                        <<"class">> => Class,
+                        <<"reason">> => Reason
+                    }
+                }
+        end,
     % Determine if we should include the full compute result in our response.
     IncludeDepth = hb_ao:get(<<"result-depth">>, Assignment, 1, Opts),
     AdditionalRes =
@@ -104,7 +138,13 @@ do_push(PrimaryProcess, Assignment, Opts) ->
             _ -> #{}
         end,
     ?event(push_depth, {depth, IncludeDepth, {assignment, Assignment}}),
-    ?event(push, {push_computed, {process, ID}, {slot, Slot}}),
+    ?event(push,
+        {push_compute_result,
+            {process, ID},
+            {slot, Slot},
+            {status, Status}
+        }
+    ),
     ?event(debug,
         {push_computed,
             {status, Status},
@@ -185,7 +225,7 @@ do_push(PrimaryProcess, Assignment, Opts) ->
                                 <<"message">> => Msg
                             }
                     end,
-                    hb_util:lower_case_key_map(
+                    hb_util:lower_case_keys(
                         hb_ao:normalize_keys(hb_private:reset(Outbox)),
                         Opts
                     ),
@@ -239,7 +279,7 @@ maybe_evaluate_message(Message, Opts) ->
 %% the slot number from which it was sent, and the outbox key of the message,
 %% and the depth to which downstream results should be included in the message.
 push_result_message(TargetProcess, MsgToPush, Origin, Opts) ->
-    NormMsgToPush = hb_util:lower_case_key_map(MsgToPush, Opts),
+    NormMsgToPush = hb_ao:normalize_keys(MsgToPush, Opts),
     case hb_ao:get(<<"target">>, NormMsgToPush, undefined, Opts) of
         undefined ->
             ?event(push,
@@ -248,6 +288,50 @@ push_result_message(TargetProcess, MsgToPush, Origin, Opts) ->
             ),
             #{};
         TargetID ->
+            case read_delivery_marker(Origin, TargetID, Opts) of
+                {ok, BinSlot} ->
+                    ?event(push_short,
+                        {skip_already_delivered,
+                            {target, TargetID},
+                            {origin, Origin},
+                            {delivered_slot, BinSlot}
+                        },
+                        Opts
+                    ),
+                    Depth = hb_ao:get(<<"result-depth">>, Origin, 1, Opts),
+                    case Depth > 0 of
+                        true ->
+                            case safe_int(BinSlot) of
+                                {ok, DeliveredSlot} ->
+                                    case push_downstream(TargetID, DeliveredSlot, Origin, Opts) of
+                                        {ok, Downstream} ->
+                                            #{
+                                                <<"target">> => TargetID,
+                                                <<"slot">> => DeliveredSlot,
+                                                <<"resulted-in">> => Downstream,
+                                                <<"skipped">> => <<"already-delivered">>
+                                            };
+                                        {error, Error} ->
+                                            #{
+                                                <<"response">> => <<"error">>,
+                                                <<"target">> => TargetID,
+                                                <<"reason">> => Error,
+                                                <<"skipped">> => <<"already-delivered">>
+                                            }
+                                    end;
+                                error ->
+                                    #{
+                                        <<"target">> => TargetID,
+                                        <<"skipped">> => <<"already-delivered">>
+                                    }
+                            end;
+                        false ->
+                            #{
+                                <<"target">> => TargetID,
+                                <<"skipped">> => <<"already-delivered">>
+                            }
+                    end;
+                not_found ->
             ?event(push,
                 {pushing_child,
                     {target, TargetID},
@@ -264,47 +348,37 @@ push_result_message(TargetProcess, MsgToPush, Origin, Opts) ->
                     % Get the ID of the message that was pushed. We already have
                     % the 'origin' message, but we need the signed ID.
                     PushedMsgID = hb_message:id(PushedMsg, all, Opts),
+                    ok = write_delivery_marker(Origin, TargetID, NextSlotOnProc, Opts),
                     ?event(push_short,
                         {pushed_message_to,
                             {process, TargetID},
                             {slot, NextSlotOnProc}
                         }
                     ),
-                    {ok, TargetBase} = hb_cache:read(TargetID, Opts),
-                    TargetAsProcess = dev_process:ensure_process_key(TargetBase, Opts),
-                    RecvdID = hb_message:id(TargetBase, all, Opts),
-                    ?event(push, {recvd_id, {id, RecvdID}, {msg, TargetAsProcess}}),
-                    % Push the message downstream. We decrease the result-depth.
-                    Recurse =
-                        hb_ao:resolve(
-                            {as, <<"process@1.0">>, TargetAsProcess},
-                            #{
-                                <<"path">> => <<"push">>,
-                                <<"slot">> => NextSlotOnProc,
-                                <<"result-depth">> =>
-                                    hb_ao:get(
-                                        <<"result-depth">>,
-                                        Origin,
-                                        1,
-                                        Opts
-                                    ) - 1
-                            },
-                            Opts#{ cache_control => <<"always">> }
-                        ),
-                    case Recurse of
-                        {ok, Downstream} ->
+                    Depth = hb_ao:get(<<"result-depth">>, Origin, 1, Opts),
+                    case Depth > 0 of
+                        true ->
+                            case push_downstream(TargetID, NextSlotOnProc, Origin, Opts) of
+                                {ok, Downstream} ->
+                                    #{
+                                        <<"id">> => PushedMsgID,
+                                        <<"target">> => TargetID,
+                                        <<"slot">> => NextSlotOnProc,
+                                        <<"resulted-in">> => Downstream
+                                    };
+                                {error, Error} ->
+                                    ?event(push, {push_failed, {error, Error}}, Opts),
+                                    #{
+                                        <<"response">> => <<"error">>,
+                                        <<"target">> => TargetID,
+                                        <<"reason">> => Error
+                                    }
+                            end;
+                        false ->
                             #{
                                 <<"id">> => PushedMsgID,
                                 <<"target">> => TargetID,
-                                <<"slot">> => NextSlotOnProc,
-                                <<"resulted-in">> => Downstream
-                            };
-                        {error, Error} ->
-                            ?event(push, {push_failed, {error, Error}}, Opts),
-                            #{
-                                <<"response">> => <<"error">>,
-                                <<"target">> => TargetID,
-                                <<"reason">> => Error
+                                <<"slot">> => NextSlotOnProc
                             }
                     end;
                 {error, Error} ->
@@ -315,7 +389,136 @@ push_result_message(TargetProcess, MsgToPush, Origin, Opts) ->
                         <<"reason">> => Error
                     }
             end
+            end
     end.
+
+delivery_marker_path(Origin, TargetID, Opts) ->
+    Proc = hb_ao:get(<<"process">>, Origin, <<>>, Opts),
+    Slot = hb_ao:get(<<"slot">>, Origin, <<>>, Opts),
+    OutboxKey = hb_ao:get(<<"outbox-key">>, Origin, <<>>, Opts),
+    Data =
+        <<
+            (hb_util:bin(Proc))/binary,
+            ":",
+            (hb_util:bin(Slot))/binary,
+            ":",
+            (hb_util:bin(OutboxKey))/binary,
+            ":",
+            (hb_util:bin(TargetID))/binary
+        >>,
+    Hex = binary:encode_hex(crypto:hash(sha256, Data)),
+    <<?PUSH_DELIVERED_PREFIX/binary, Hex/binary>>.
+
+read_delivery_marker(Origin, TargetID, Opts) ->
+    Path = delivery_marker_path(Origin, TargetID, Opts),
+    case hb_cache:read(Path, Opts#{ hashpath => ignore }) of
+        {ok, Bin} when is_binary(Bin) -> {ok, Bin};
+        {ok, Other} -> {ok, hb_util:bin(Other)};
+        not_found -> not_found;
+        _ -> not_found
+    end.
+
+write_delivery_marker(Origin, TargetID, Slot, Opts) ->
+    Path = delivery_marker_path(Origin, TargetID, Opts),
+    case hb_cache:write_binary(Path, hb_util:bin(Slot), Opts#{ hashpath => ignore }) of
+        {ok, _} -> ok;
+        _ -> ok
+    end.
+
+safe_int(Bin) ->
+    try {ok, hb_util:int(Bin)} catch _:_ -> error end.
+
+%% @doc Push a downstream resultant message that has already been scheduled.
+%% We determine whether to push the message locally or remotely based on the
+%% `push_route_downstream' option.
+push_downstream(TargetID, NextSlotOnProc, Origin, Opts) ->
+    case hb_opts:get(push_route_downstream, true, Opts) of
+        true -> push_downstream_remote(TargetID, NextSlotOnProc, Origin, Opts);
+        false -> push_downstream_local(TargetID, NextSlotOnProc, Origin, Opts)
+    end.
+
+%% @doc Push a downstream message on a remote node if a route can be found to
+%% perform the action. If no route is found, we execute the action locally.
+push_downstream_remote(TargetID, NextSlotOnProc, Origin, RawOpts) ->
+    Path = <<TargetID/binary, "/push&slot=", (hb_util:bin(NextSlotOnProc))/binary>>,
+    RouteReq =
+        #{
+            <<"path">> => <<"route">>,
+            <<"route-path">> => Path
+        },
+    Opts =
+        case dev_whois:ensure_host(RawOpts) of
+            {ok, NewOpts} -> NewOpts;
+            _ -> RawOpts
+        end,
+    Self = hb_opts:get(host, host_not_specified, Opts),
+    ?event(remote_push,
+        {push_downstream_remote,
+            {target, TargetID},
+            {slot, NextSlotOnProc},
+            {origin, Origin},
+            {opts, Opts}
+        }
+    ),
+    case hb_ao:resolve(#{ <<"device">> => <<"router@1.0">> }, RouteReq, Opts) of
+        {error, no_matches} ->
+            ?event(push,
+                {no_push_route_found,
+                    {target, TargetID},
+                    {slot, NextSlotOnProc},
+                    {continuing, locally}
+                },
+                Opts
+            ),
+            push_downstream_local(TargetID, NextSlotOnProc, Origin, Opts);
+        {ok, Self} ->
+            % If we matched ourselves as the route, we can just push locally.
+            ?event(push,
+                {routing_matched_self,
+                    {target, TargetID},
+                    {slot, NextSlotOnProc},
+                    {continuing, locally}
+                },
+                Opts
+            ),
+            push_downstream_local(TargetID, NextSlotOnProc, Origin, Opts);
+        {ok, Node} ->
+            ?event(push,
+                {routing_matched_remote,
+                    {target, TargetID},
+                    {slot, NextSlotOnProc},
+                    {node, Node}
+                },
+                Opts
+            ),
+            hb_http:post(Node, Path, Opts)
+    end.
+
+%% @doc Push a resulting message recursively, executing the action on this node.
+push_downstream_local(TargetID, NextSlotOnProc, Origin, Opts) ->
+    ?event(push,
+        {push_downstream_local,
+            {target, TargetID},
+            {slot, NextSlotOnProc},
+            {origin, Origin}
+        }
+    ),
+    % Push the message downstream. We decrease the result-depth.
+    hb_ao:resolve(
+        {as, <<"process@1.0">>, TargetID},
+        #{
+            <<"path">> => <<"push">>,
+            <<"slot">> => NextSlotOnProc,
+            <<"result-depth">> =>
+                hb_ao:get(
+                    <<"result-depth">>,
+                    Origin,
+                    1,
+                    Opts
+                ) - 1
+        },
+        Opts#{ cache_control => <<"always">> }
+    ).
 
 %% @doc Augment the message with from-* keys, if it doesn't already have them.
 normalize_message(MsgToPush, Opts) ->
@@ -358,13 +561,19 @@ calculate_base_id(GivenProcess, Opts) ->
             not_found -> GivenProcess;
             Proc -> Proc
         end,
-    BaseProcess = maps:without([<<"authority">>, <<"scheduler">>], Process),
-    {ok, BaseID} = hb_ao:resolve(
-        BaseProcess,
-        #{ <<"path">> => <<"id">> },
-        Opts
-    ),
-    ?event({push_generated_base, {id, BaseID}, {base, BaseProcess}}),
+    BaseProcess =
+        hb_ao:set(
+            Process,
+            #{ <<"authority">> => unset, <<"scheduler">> => unset },
+            Opts#{ hashpath => ignore }
+        ),
+    {ok, BaseID} =
+        hb_ao:resolve(
+            BaseProcess,
+            #{ <<"path">> => <<"id">>, <<"committers">> => <<"none">> },
+            Opts
+        ),
+    ?event(debug_base, {push_generated_base, {id, BaseID}, {base, BaseProcess}}),
     BaseID.
 
 %% @doc Add the necessary keys to the message to be scheduled, then schedule it.
@@ -633,456 +842,3 @@ parse_redirect(Location, Opts) ->
             }
         ),
     {Node, hb_maps:get(path, Parsed, undefined, Opts)}.
-
-%%% Tests
-
-full_push_test_() ->
-    {timeout, 30, fun() ->
-        dev_process:init(),
-        Opts = #{
-            process_async_cache => false,
-            priv_wallet => hb:wallet(),
-            cache_control => <<"always">>
-        },
-        Msg1 = dev_process:test_aos_process(Opts),
-        hb_cache:write(Msg1, Opts),
-        {ok, SchedInit} =
-            hb_ao:resolve(Msg1, #{
-                <<"method">> => <<"POST">>,
-                <<"path">> => <<"schedule">>,
-                <<"body">> => Msg1
-            },
-            Opts
-        ),
-        ?event({test_setup, {msg1, Msg1}, {sched_init, SchedInit}}),
-        Script = ping_pong_script(2),
-        ?event({script, Script}),
-        {ok, Msg2} = dev_process:schedule_aos_call(Msg1, Script, Opts),
-        ?event({msg_sched_result, Msg2}),
-        {ok, StartingMsgSlot} =
-            hb_ao:resolve(Msg2, #{ <<"path">> => <<"slot">> }, Opts),
-        ?event({starting_msg_slot, StartingMsgSlot}),
-        Msg3 =
-            #{
-                <<"path">> => <<"push">>,
-                <<"slot">> => StartingMsgSlot
-            },
-        {ok, _} = hb_ao:resolve(Msg1, Msg3, Opts),
-        ?assertEqual(
-            {ok, <<"Done.">>},
-            hb_ao:resolve(Msg1, <<"now/results/data">>, Opts)
-        )
-    end}.
-
-push_as_identity_test_() ->
-    {timeout, 90, fun() ->
-        dev_process:init(),
-        % Create a new identity for the scheduler.
-        DefaultWallet = hb:wallet(),
-        SchedulingWallet = ar_wallet:new(),
-        SchedulingID = hb_util:human_id(SchedulingWallet),
-        ComputeWallet = ar_wallet:new(),
-        ComputeID = hb_util:human_id(ComputeWallet),
-        Opts = #{
-            priv_wallet => DefaultWallet,
-            cache_control => <<"always">>,
-            identities => #{
-                SchedulingID => #{
-                    priv_wallet => SchedulingWallet,
-                    store => [hb_test_utils:test_store()]
-                },
-                ComputeID => #{
-                    priv_wallet => ComputeWallet
-                }
-            }
-        },
-        % Create a new test AOS process, which will use the given identities as
-        % its authority and scheduler.
-        Msg1 =
-            dev_process:test_aos_process(
-                Opts#{
-                    authority => ComputeID,
-                    scheduler => [SchedulingID, ComputeID]
-                }
-            ),
-        ?event({msg1, Msg1}),
-        % Perform the remainder of the test as with `full_push_test_/0'.
-        hb_cache:write(Msg1, Opts),
-        {ok, SchedInit} =
-            hb_ao:resolve(Msg1, #{
-                <<"method">> => <<"POST">>,
-                <<"path">> => <<"schedule">>,
-                <<"body">> => Msg1
-            },
-            Opts
-        ),
-        ?event({test_setup, {msg1, Msg1}, {sched_init, SchedInit}}),
-        Script = ping_pong_script(2),
-        ?event({script, Script}),
-        {ok, Msg2} = dev_process:schedule_aos_call(Msg1, Script),
-        ?event(push, {msg_sched_result, Msg2}),
-        {ok, StartingMsgSlot} =
-            hb_ao:resolve(Msg2, #{ <<"path">> => <<"slot">> }, Opts),
-        ?event({starting_msg_slot, StartingMsgSlot}),
-        Msg3 =
-            #{
-                <<"path">> => <<"push">>,
-                <<"slot">> => StartingMsgSlot
-            },
-        {ok, _} = hb_ao:resolve(Msg1, Msg3, Opts),
-        ?assertEqual(
-            {ok, <<"Done.">>},
-            hb_ao:resolve(Msg1, <<"now/results/data">>, Opts)
-        ),
-        % Validate that the scheduler's wallet was used to sign the message.
-        Committers =
-            hb_ao:get(
-                <<"schedule/assignments/2/committers">>,
-                Msg1,
-                Opts
-            ),
-        ?assert(lists:member(SchedulingID, Committers)),
-        ?assert(lists:member(ComputeID, Committers)),
-        % Validate that the compute wallet was used to sign the message.
-        ?assertEqual(
-            [ComputeID],
-            hb_ao:get(<<"schedule/assignments/2/body/committers">>, Msg1, Opts)
-        )
-    end}.
-
-multi_process_push_test_() ->
-    {timeout, 30, fun() ->
-        dev_process:init(),
-        Opts = #{
-            priv_wallet => hb:wallet(),
-            cache_control => <<"always">>
-        },
-        Proc1 = dev_process:test_aos_process(Opts),
-        hb_cache:write(Proc1, Opts),
-        {ok, _SchedInit1} =
-            hb_ao:resolve(Proc1, #{
-                <<"method">> => <<"POST">>,
-                <<"path">> => <<"schedule">>,
-                <<"body">> => Proc1
-            },
-            Opts
-        ),
-        {ok, _} = dev_process:schedule_aos_call(Proc1, reply_script()),
-        Proc2 = dev_process:test_aos_process(Opts),
-        hb_cache:write(Proc2, Opts),
-        {ok, _SchedInit2} =
-            hb_ao:resolve(Proc2, #{
-                <<"method">> => <<"POST">>,
-                <<"path">> => <<"schedule">>,
-                <<"body">> => Proc2
-            },
-            Opts
-        ),
-        ProcID1 = hb_message:id(Proc1, all, Opts),
-        ProcID2 = hb_message:id(Proc2, all, Opts),
-        ?event(push, {testing_with, {proc1_id, ProcID1}, {proc2_id, ProcID2}}),
-        {ok, ToPush} = dev_process:schedule_aos_call(
-            Proc2,
-            <<
-                "Handlers.add(\"Pong\",\n"
-                "   function (test) return true end,\n"
-                "   function(m)\n"
-                "       print(\"GOT PONG\")\n"
-                "   end\n"
-                ")\n"
-                "Send({ Target = \"", (ProcID1)/binary, "\", Action = \"Ping\" })"
-            >>
-        ),
-        SlotToPush = hb_ao:get(<<"slot">>, ToPush, Opts),
-        ?event(push, {slot_to_push_proc2, SlotToPush}),
-        Msg3 =
-            #{
-                <<"path">> => <<"push">>,
-                <<"slot">> => SlotToPush,
-                <<"result-depth">> => 1
-            },
-        {ok, PushResult} = hb_ao:resolve(Proc2, Msg3, Opts),
-        ?event(push, {push_result_proc2, PushResult}),
-        AfterPush = hb_ao:resolve(Proc2, <<"now/results/data">>, Opts),
-        ?event(push, {after_push, AfterPush}),
-        ?assertEqual({ok, <<"GOT PONG">>}, AfterPush)
-    end}.
-
-push_with_redirect_hint_test_disabled() ->
-    {timeout, 30, fun() ->
-        dev_process:init(),
-        Stores =
-            [
-                #{
-                    <<"store-module">> => hb_store_fs,
-                    <<"name">> => <<"cache-TEST">>
-                }
-            ],
-        ExtOpts = #{ priv_wallet => ar_wallet:new(), store => Stores },
-        LocalOpts = #{ priv_wallet => hb:wallet(), store => Stores },
-        ExtScheduler = hb_http_server:start_node(ExtOpts),
-        ?event(push, {external_scheduler, {location, ExtScheduler}}),
-        % Create the Pong server and client
-        Client = dev_process:test_aos_process(),
-        PongServer = dev_process:test_aos_process(ExtOpts),
-        % Push the new process that runs on the external scheduler
-        {ok, ServerSchedResp} =
-            hb_http:post(
-                ExtScheduler,
-                <<"/push">>,
-                PongServer,
-                ExtOpts
-            ),
-        ?event(push, {pong_server_sched_resp, ServerSchedResp}),
-        % Get the IDs of the server process
-        PongServerID =
-            hb_ao:get(
-                <<"process/id">>,
-                dev_process:ensure_process_key(PongServer, LocalOpts),
-                LocalOpts
-            ),
-        {ok, ServerScriptSchedResp} =
-            hb_http:post(
-                ExtScheduler,
-                <<PongServerID/binary, "/push">>,
-                #{
-                    <<"body">> =>
-                        hb_message:commit(
-                            #{
-                                <<"target">> => PongServerID,
-                                <<"action">> => <<"Eval">>,
-                                <<"type">> => <<"Message">>,
-                                <<"data">> => reply_script()
-                            },
-                            ExtOpts
-                        )
-                },
-                ExtOpts
-            ),
-        ?event(push, {pong_server_script_sched_resp, ServerScriptSchedResp}),
-        {ok, ToPush} =
-            dev_process:schedule_aos_call(
-                Client,
-                <<
-                    "Handlers.add(\"Pong\",\n"
-                    "   function (test) return true end,\n"
-                    "   function(m)\n"
-                    "       print(\"GOT PONG\")\n"
-                    "   end\n"
-                    ")\n"
-                    "Send({ Target = \"",
-                        (PongServerID)/binary, "?hint=",
-                        (ExtScheduler)/binary,
-                    "\", Action = \"Ping\" })\n"
-                >>,
-                LocalOpts
-            ),
-        SlotToPush = hb_ao:get(<<"slot">>, ToPush, LocalOpts),
-        ?event(push, {slot_to_push_client, SlotToPush}),
-        Msg3 = #{ <<"path">> => <<"push">>, <<"slot">> => SlotToPush },
-        {ok, PushResult} = hb_ao:resolve(Client, Msg3, LocalOpts),
-        ?event(push, {push_result_client, PushResult}),
-        AfterPush = hb_ao:resolve(Client, <<"now/results/data">>, LocalOpts),
-        ?event(push, {after_push, AfterPush}),
-        % Note: This test currently only gets a reply that the message was not
-        % trusted by the process. To fix this, we would have to add another 
-        % trusted authority to the `test_aos_process' call. For now, this is 
-        % enough to validate that redirects are pushed through correctly.
-        ?assertEqual({ok, <<"GOT PONG">>}, AfterPush)
-    end}.
-
-push_prompts_encoding_change_test_() ->
-    {timeout, 30, fun push_prompts_encoding_change/0}.
-push_prompts_encoding_change() ->
-    dev_process:init(),
-    Opts = #{
-        priv_wallet => hb:wallet(),
-        cache_control => <<"always">>,
-        store =>
-            [
-                #{ <<"store-module">> => hb_store_fs, <<"name">> => <<"cache-TEST">> },
-                % Include a gateway store so that we can get the legacynet 
-                % process when needed.
-                #{ <<"store-module">> => hb_store_gateway,
-                    <<"store">> => #{
-                        <<"store-module">> => hb_store_fs,
-                        <<"name">> => <<"cache-TEST">>
-                    }
-                }
-            ]
-    },
-    Msg = hb_message:commit(#{
-        <<"path">> => <<"push">>,
-        <<"method">> => <<"POST">>,
-        <<"target">> => <<"QQiMcAge5ZtxcUV7ruxpi16KYRE8UBP0GAAqCIJPXz0">>,
-        <<"action">> => <<"Eval">>,
-        <<"data">> => <<"print(\"Please ignore!\")">>
-    }, Opts),
-    ?event(push, {msg1, Msg}),
-    Res =
-        hb_ao:resolve_many(
-            [
-                <<"QQiMcAge5ZtxcUV7ruxpi16KYRE8UBP0GAAqCIJPXz0">>,
-                {as, <<"process@1.0">>, <<>>},
-                Msg
-            ],
-            Opts
-        ),
-    ?assertMatch({error, #{ <<"status">> := 422 }}, Res).
-
-oracle_push_test_() -> {timeout, 30, fun oracle_push/0}.
-oracle_push() ->
-    dev_process:init(),
-    Client = dev_process:test_aos_process(),
-    {ok, _} = hb_cache:write(Client, #{}),
-    {ok, _} = dev_process:schedule_aos_call(Client, oracle_script()),
-    Msg3 =
-        #{
-            <<"path">> => <<"push">>,
-            <<"slot">> => 0
-        },
-    {ok, PushResult} = hb_ao:resolve(Client, Msg3, #{ priv_wallet => hb:wallet() }),
-    ?event({result, PushResult}),
-    ComputeRes =
-        hb_ao:resolve(
-            Client,
-            <<"now/results/data">>,
-            #{ priv_wallet => hb:wallet() }
-        ),
-    ?event({compute_res, ComputeRes}),
-    ?assertMatch({ok, _}, ComputeRes).
-
--ifdef(ENABLE_GENESIS_WASM).
-%% @doc Test that a message that generates another message which resides on an
-%% ANS-104 scheduler leads to `~push@1.0` re-signing the message correctly.
-%% Requires `ENABLE_GENESIS_WASM' to be enabled.
-nested_push_prompts_encoding_change_test_() ->
-    {timeout, 30, fun nested_push_prompts_encoding_change/0}.
-nested_push_prompts_encoding_change() ->
-    dev_process:init(),
-    Opts = #{
-        priv_wallet => hb:wallet(),
-        cache_control => <<"always">>,
-        store => hb_opts:get(store)
-    },
-    ?event(push_debug, {opts, Opts}),
-    Msg1 = dev_process:test_aos_process(Opts),
-    hb_cache:write(Msg1, Opts),
-    {ok, SchedInit} =
-        hb_ao:resolve(Msg1, #{
-            <<"method">> => <<"POST">>,
-            <<"path">> => <<"schedule">>,
-            <<"body">> => Msg1
-        },
-        Opts
-    ),
-    ?event({test_setup, {msg1, Msg1}, {sched_init, SchedInit}}),
-    Script = message_to_legacynet_scheduler_script(),
-    ?event({script, Script}),
-    {ok, Msg2} = dev_process:schedule_aos_call(Msg1, Script),
-    ?event(push, {msg_sched_result, Msg2}),
-    {ok, StartingMsgSlot} =
-        hb_ao:resolve(Msg2, #{ <<"path">> => <<"slot">> }, Opts),
-    ?event({starting_msg_slot, StartingMsgSlot}),
-    Msg3 =
-        #{
-            <<"path">> => <<"push">>,
-            <<"slot">> => StartingMsgSlot
-        },
-    {ok, Res} = hb_ao:resolve(Msg1, Msg3, Opts),
-    ?event(push, {res, Res}),
-    Msg = hb_message:commit(#{
-        <<"path">> => <<"push">>,
-        <<"method">> => <<"POST">>,
-        <<"body">> =>
-            hb_message:commit(
-                #{
-                    <<"target">> => hb_message:id(Msg1, all, Opts),
-                    <<"action">> => <<"Ping">>
-                },
-                Opts
-            )
-    }, Opts),
-    ?event(push, {msg1, Msg}),
-    Res2 =
-        hb_ao:resolve_many(
-            [
-                hb_message:id(Msg1, all, Opts),
-                {as, <<"process@1.0">>, <<>>},
-                Msg
-            ],
-            Opts
-        ),
-    ?assertMatch({ok, #{ <<"1">> := #{ <<"resulted-in">> := _ }}}, Res2).
--endif.
-%%% Test helpers
-
-ping_pong_script(Limit) ->
-    <<
-        "Handlers.add(\"Ping\",\n"
-        "   function (test) return true end,\n"
-        "   function(m)\n"
-        "       C = tonumber(m.Count)\n"
-        "       if C <= ", (integer_to_binary(Limit))/binary, " then\n"
-        "           Send({ Target = ao.id, Action = \"Ping\", Count = C + 1 })\n"
-        "           print(\"Ping\", C + 1)\n"
-        "       else\n"
-        "           print(\"Done.\")\n"
-        "       end\n"
-        "   end\n"
-        ")\n"
-        "Send({ Target = ao.id, Action = \"Ping\", Count = 1 })\n"
-    >>.
-
-reply_script() ->
-    <<
-        """
-        Handlers.add("Reply",
-           { Action = "Ping" },
-           function(m)
-               print("Replying to...")
-               print(m.From)
-               Send({ Target = m.From, Action = "Reply", Message = "Pong!" })
-               print("Done.")
-           end
-        )
-        """
-    >>.
-
-message_to_legacynet_scheduler_script() ->
-    <<
-        """
-        Handlers.add("Ping",
-           { Action = "Ping" },
-           function(m)
-               print("Pinging...")
-               print(m.From)
-               Send({
-                    Target = "QQiMcAge5ZtxcUV7ruxpi16KYRE8UBP0GAAqCIJPXz0",
-                    Action = "Ping"
-                })
-               print("Done.")
-           end
-        )
-        """
-    >>.
-
-oracle_script() ->
-    <<
-        """
-        Handlers.add("Oracle",
-            function(m)
-                return true
-            end,
-            function(m)
-                print(m.Body)
-            end
-        )
-        Send({
-            target = ao.id,
-            resolve = "/~relay@1.0/call",
-            ["relay-path"] = "https://arweave.net"
-        })
-        
-        """
-    >>.

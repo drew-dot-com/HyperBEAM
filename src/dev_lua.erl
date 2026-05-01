@@ -126,10 +126,8 @@ load_modules([Module | Rest], Opts, Acc) when is_map(Module) ->
                 <<"status">> => 404,
                 <<"body">> =>
                     <<
-                        """
-                        Lua module not loadable. Lua modules must have a
-                        `body' element set to a binary of the code to load.
-                        """
+                        "Lua module not loadable. Lua modules must have a `body' "
+                        "element set to a binary of the code to load."
                     >>,
                 <<"module">> => Module
             }};
@@ -152,22 +150,56 @@ load_modules([Module | Rest], Opts, Acc) when is_map(Module) ->
 %% @doc Initialize a new Lua state with a given base message and module.
 initialize(Base, Modules, Opts) ->
     State0 = luerl:init(),
+    State0b =
+        case hb_opts:get(disable_send_init, false, Opts) of
+            true ->
+                {ok, Stubbed} =
+                    luerl:set_table_keys_dec(
+                        ['Send'],
+                        fun(_Args, State) -> {[], State} end,
+                        State0
+                    ),
+                Stubbed;
+            false ->
+                State0
+        end,
     % Load each script into the Lua state.
     State1 =
         lists:foldl(
             fun({ModuleID, ModuleBin}, StateIn) ->
-                {ok, _, StateOut} =
-                    luerl:do_dec(
-                        ModuleBin,
+                WrappedBin = wrap_module(ModuleBin),
+                {ok, RetEnc, StateOut} =
+                    luerl:do(
+                        WrappedBin,
                         [
                             {name, hb_util:list(ModuleID)},
                             {file, hb_util:list(ModuleID)}
                         ],
                         StateIn
                     ),
-                StateOut
+                % Many AO Lua modules return an entrypoint function (e.g. `handle`)
+                % rather than exporting it on `_G`. Capture the returned value as an
+                % entrypoint for later fallback calls, and best-effort install it as
+                % `_G.compute` when absent.
+                EntrypointEnc =
+                    case RetEnc of
+                        [V | _] -> V;
+                        _ -> nil
+                    end,
+                {ok, ComputeEnc, StateOut2} = luerl:get_table_keys([<<"compute">>], StateOut),
+                StateOut3 =
+                    case {ComputeEnc, EntrypointEnc} of
+                        {nil, nil} ->
+                            StateOut2;
+                        {nil, _} ->
+                            {ok, StateOut4} = luerl:set_table_keys([<<"compute">>], EntrypointEnc, StateOut2),
+                            StateOut4;
+                        _ ->
+                            StateOut2
+                    end,
+                StateOut3
             end,
-            State0,
+            State0b,
             Modules
         ),
     % Apply any sandboxing rules to the state.
@@ -182,6 +214,18 @@ initialize(Base, Modules, Opts) ->
     % Return the base message with the state added to it.
     {ok, hb_private:set(Base, <<"state">>, State3, Opts)}.
 
+wrap_module(ModuleBin) when is_binary(ModuleBin) ->
+    <<
+        "local __hb_mod = function()\n",
+        ModuleBin/binary,
+        "\nend\n",
+        "__hb_mod()\n",
+        "if type(compute) ~= \"function\" and type(handle) == \"function\" then\n",
+        "  compute = handle\n",
+        "end\n",
+        "return compute\n"
+    >>.
+
 %%% @doc Return a list of all functions in the Lua environment.
 functions(Base, _Req, Opts) ->
     case hb_private:get(<<"state">>, Base, Opts) of
@@ -191,15 +235,13 @@ functions(Base, _Req, Opts) ->
             {ok, [Res], _S2} =
                 luerl:do_dec(
                     <<
-                        """
-                        local __tests = {}
-                        for k, v in pairs(_G) do
-                            if type(v) == "function" then
-                                table.insert(__tests, k)
-                            end
-                        end
-                        return __tests
-                        """
+                        "local __tests = {}\n"
+                        "for k, v in pairs(_G) do\n"
+                        "  if type(v) == \"function\" then\n"
+                        "    table.insert(__tests, k)\n"
+                        "  end\n"
+                        "end\n"
+                        "return __tests\n"
                     >>,
                     State
                 ),
@@ -232,16 +274,32 @@ compute(Key, RawBase, Req, Opts) ->
     % TODO: looks like the script is injected in multiple places, does the 
     % script need to be passed?
     % Get the Lua function to call from the base message.
-    Function =
+    FallbackKey =
+        case Key of
+            nil -> <<"compute">>;
+            undefined -> <<"compute">>;
+            <<>> -> <<"compute">>;
+            [] -> <<"compute">>;
+            _ -> Key
+        end,
+    Function0 =
         hb_ao:get_first(
             [
                 {Req, <<"body/function">>},
                 {Req, <<"function">>},
                 {{as, <<"message@1.0">>, Base}, <<"function">>}
             ],
-            Key,
+            FallbackKey,
             Opts#{ hashpath => ignore }
         ),
+    Function =
+        case Function0 of
+            not_found -> FallbackKey;
+            nil -> FallbackKey;
+            <<>> -> FallbackKey;
+            [] -> FallbackKey;
+            Found -> Found
+        end,
     ?event(debug_lua, function_found),
     Params =
         hb_ao:get_first(
@@ -268,18 +326,31 @@ compute(Key, RawBase, Req, Opts) ->
             {req, Req}
         }
     ),
-    process_response(
+    EncodedParams = encode(ResolvedParams, Opts),
+    CallRes0 =
         try luerl:call_function_dec(
             [Function],
-            encode(ResolvedParams, Opts),
+            EncodedParams,
             State
         )
         catch
             _:Reason:Stacktrace -> {error, Reason, Stacktrace}
         end,
+    CallRes = CallRes0,
+    process_response_with_function(
+        CallRes,
         OldPriv,
-		Opts
+		Opts,
+        Function
     ).
+
+process_response_with_function(Res, Priv, Opts, Function) ->
+    case process_response(Res, Priv, Opts) of
+        {error, Msg} when is_map(Msg) ->
+            {error, Msg#{ <<"lua-function">> => Function }};
+        Other ->
+            Other
+    end.
 
 %% @doc Process a response to a Luerl invocation. Returns the typical AO-Core
 %% HyperBEAM response format.
@@ -479,11 +550,9 @@ multiple_modules_test() ->
     {ok, Module} = file:read_file("test/test.lua"),
     Module2 =
         <<
-            """
-            function test_second_script()
-                return 4
-            end
-            """
+            "function test_second_script()\n"
+            "  return 4\n"
+            "end\n"
         >>,
     Base = #{
         <<"device">> => <<"lua@5.3a">>,
@@ -797,15 +866,15 @@ generate_test_message(Process, Opts) ->
     generate_test_message(
         Process,
         Opts,
-        <<""" 
-        Count = 0
-        function add() 
-            Send({Target = 'Foo', Data = 'Bar' });
-            Count = Count + 1 
-        end
-        add()
-        return Count
-        """>>
+        <<
+            "Count = 0\n"
+            "function add()\n"
+            "  Send({Target = 'Foo', Data = 'Bar' });\n"
+            "  Count = Count + 1\n"
+            "end\n"
+            "add()\n"
+            "return Count\n"
+        >>
     ).
 generate_test_message(Process, Opts, ToEval) when is_binary(ToEval) ->
     generate_test_message(

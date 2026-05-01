@@ -25,7 +25,7 @@ start() ->
     Loaded =
         case hb_opts:load(Loc = hb_opts:get(hb_config_location, <<"config.flat">>)) of
             {ok, Conf} ->
-                ?event(boot, {loaded_config, Loc, Conf}),
+                ?event(boot, {loaded_config, {path, Loc}, {config, Conf}}),
                 Conf;
             {error, Reason} ->
                 ?event(boot, {failed_to_load_config, Loc, Reason}),
@@ -42,7 +42,8 @@ start() ->
     UpdatedStoreOpts = 
         case StoreOpts of
             no_store -> no_store;
-            _ when is_list(StoreOpts) -> hb_store_opts:apply(StoreOpts, StoreDefaults);
+            _ when is_list(StoreOpts) ->
+                hb_store_opts:apply(StoreOpts, StoreDefaults);
             _ -> StoreOpts
         end,
     hb_store:start(UpdatedStoreOpts),
@@ -54,7 +55,7 @@ start() ->
                 Loaded
             )
         ),
-    maybe_greeter(MergedConfig, PrivWallet),
+    maybe_greeter(Loaded, PrivWallet),
     start(
         Loaded#{
             priv_wallet => PrivWallet,
@@ -109,12 +110,12 @@ print_greeter(Config, PrivWallet) ->
         "==        ██████╔╝███████╗██║  ██║██║ ╚═╝ ██║ BUILD THE  ==~n"
         "==        ╚═════╝ ╚══════╝╚═╝  ╚═╝╚═╝     ╚═╝    FUTURE. ==~n"
         "===========================================================~n"
-        "== Node activate at: ~s ==~n"
+        "== Node live at: ~s ==~n"
         "== Operator: ~s ==~n"
         "===========================================================~n"
         "== Config:                                               ==~n"
         "===========================================================~n"
-        "   ~s~n"
+        "   ~s~n~n"
         "===========================================================~n",
         [
             ?HYPERBEAM_VERSION,
@@ -128,7 +129,9 @@ print_greeter(Config, PrivWallet) ->
                         ]
                     )
                 ),
-                35, leading, $ 
+                39,
+                leading,
+                $ % Note: Space after `$` is functional, not garbage.
             ),
             hb_util:human_id(ar_wallet:to_address(PrivWallet)),
             FormattedConfig
@@ -193,6 +196,7 @@ new_server(RawNodeMsg) ->
                 % Attempt to start the prometheus application, if possible.
                 try
                     application:ensure_all_started([prometheus, prometheus_cowboy]),
+                    prometheus_registry:register_collector(hb_metrics_collector),
                     ProtoOpts#{
                         metrics_callback =>
                             fun prometheus_cowboy2_instrumenter:observe/1,
@@ -380,55 +384,138 @@ handle_request(RawReq, Body, ServerID) ->
                     {cowboy_req, {explicit, Req}, {body, {string, Body}}}
                 }
             ),
-            TracePID = hb_tracer:start_trace(),
             % Parse the HTTP request into HyerBEAM's message format.
-            ReqSingleton =
-                try hb_http:req_to_tabm_singleton(Req, Body, NodeMsg)
-                catch ParseError:ParseDetails:ParseStacktrace ->
-                    {parse_error, ParseError, ParseDetails, ParseStacktrace}
-                end,
-            try 
-                case ReqSingleton of
-                    {parse_error, PType, PDetails, PStacktrace} ->
-                        erlang:raise(PType, PDetails, PStacktrace);
-                    _ ->
-                        ok
-                end,
-                CommitmentCodec = hb_http:accept_to_codec(ReqSingleton, NodeMsg),
-                ?event(http,
-                    {parsed_singleton,
-                        {req_singleton, ReqSingleton},
-                        {accept_codec, CommitmentCodec}},
-                    #{trace => TracePID}
-                ),
-                % hb_tracer:record_step(TracePID, request_parsing),
-                % Invoke the meta@1.0 device to handle the request.
-                {ok, Res} =
-                    dev_meta:handle(
-                        NodeMsg#{
-                            commitment_device => CommitmentCodec,
-                            trace => TracePID
-                        },
-                        ReqSingleton
-                    ),
-                hb_http:reply(Req, ReqSingleton, Res, NodeMsg)
-            catch
-                Type:Details:Stacktrace ->
-                    handle_error(
-                        Req,
-                        ReqSingleton,
-                        Type,
-                        Details,
-                        Stacktrace,
-                        NodeMsg
-                    )
+            try hb_http:req_to_tabm_singleton(Req, Body, NodeMsg) of
+                ReqSingleton ->
+                    try
+                        CommitmentCodec =
+                            hb_http:accept_to_codec(ReqSingleton, NodeMsg),
+                        ?event(http,
+                            {parsed_singleton,
+                                {req_singleton, ReqSingleton},
+                                {accept_codec, CommitmentCodec}},
+                            #{}
+                        ),
+                        % Invoke the meta@1.0 device to handle the request.
+                        {ok, Res} =
+                            dev_meta:handle(
+                                NodeMsg#{
+                                    commitment_device => CommitmentCodec
+                                },
+                                ReqSingleton
+                            ),
+                        hb_http:reply(Req, ReqSingleton, Res, NodeMsg)
+                    catch
+                        Type:Details:Stacktrace ->
+                            handle_error(
+                                Req,
+                                ReqSingleton,
+                                Type,
+                                Details,
+                                Stacktrace,
+                                NodeMsg
+                            )
+                    end
+            catch ParseError:ParseDetails:ParseStacktrace ->
+                handle_error(
+                    Req,
+                    #{},
+                    ParseError,
+                    ParseDetails,
+                    ParseStacktrace,
+                    NodeMsg
+                )
             end
     end.
 
 %% @doc Return a 500 error response to the client.
 handle_error(Req, Singleton, Type, Details, Stacktrace, NodeMsg) ->
-    DetailsStr = hb_util:bin(hb_format:message(Details, NodeMsg, 1)),
-    StacktraceStr = hb_util:bin(hb_format:trace(Stacktrace)),
+    % Extract a compact, load-bearing summary for common error types before
+    % `remove_noise/1` strips context. This is especially important for
+    % `device_failed` where the actionable reason often lives under `{info, ...}`.
+    {DevNum, InfoSummary0, IsDeviceFailed} =
+        case Details of
+            {device_failed, {dev_num, DevN}, _Base, _Req, {info, Info}} ->
+                InfoBin =
+                    case Info of
+                        #{ <<"status">> := Status, <<"body">> := Body } ->
+                            BodyStr = hb_util:bin(hb_format:message(Body, NodeMsg, 1)),
+                            LuaFunc =
+                                case maps:get(<<"lua-function">>, Info, undefined) of
+                                    undefined -> <<>>;
+                                    LuaFuncVal ->
+                                        iolist_to_binary([
+                                            <<" lua-function=">>,
+                                            hb_util:bin(io_lib:format("~p", [LuaFuncVal]))
+                                        ])
+                                end,
+                            TraceHead =
+                                case maps:get(<<"trace">>, Info, undefined) of
+                                    Trace when is_map(Trace) ->
+                                        Frame1 =
+                                            case maps:get(1, Trace, undefined) of
+                                                undefined -> maps:get(<<"1">>, Trace, undefined);
+                                                V -> V
+                                            end,
+                                        case Frame1 of
+                                            #{ <<"function">> := Fn, <<"line">> := Line } ->
+                                                iolist_to_binary([
+                                                    <<" trace1=function=">>,
+                                                    hb_util:bin(io_lib:format("~p", [Fn])),
+                                                    <<" line=">>,
+                                                    hb_util:bin(io_lib:format("~p", [Line]))
+                                                ]);
+                                            _ ->
+                                                <<>>
+                                        end;
+                                    _ ->
+                                        <<>>
+                                end,
+                            iolist_to_binary([
+                                <<"status=">>,
+                                hb_util:bin(io_lib:format("~p", [Status])),
+                                <<" body=">>,
+                                BodyStr,
+                                LuaFunc,
+                                TraceHead
+                            ]);
+                        _ ->
+                            hb_util:bin(hb_format:message(Info, NodeMsg, 1))
+                    end,
+                {DevN, InfoBin, true};
+            {device_failed, {dev_num, DevN}, _Base, _Req, _} ->
+                {DevN, <<>>, true};
+            _ ->
+                {undefined, <<>>, false}
+        end,
+    InfoSummary1 = hb_util:bin(hb_format:remove_noise(InfoSummary0)),
+    InfoSummary =
+        case byte_size(InfoSummary1) > 4096 of
+            true -> binary:part(InfoSummary1, 0, 4096);
+            false -> InfoSummary1
+        end,
+    % Avoid emitting multi-MB error payloads (and doing expensive formatting) for
+    % common large errors like device failures (which often include full Base/Req).
+    DetailsStr0 =
+        case IsDeviceFailed of
+            true when DevNum =/= undefined ->
+                hb_util:bin(io_lib:format("{device_failed,{dev_num,~p}}", [DevNum]));
+            _ ->
+                hb_util:bin(hb_format:message(Details, NodeMsg, 1))
+        end,
+    StacktraceStr0 = hb_util:bin(hb_format:trace(Stacktrace)),
+    DetailsStr1 = hb_util:bin(hb_format:remove_noise(DetailsStr0)),
+    StacktraceStr1 = hb_util:bin(hb_format:remove_noise(StacktraceStr0)),
+    DetailsStr =
+        case byte_size(DetailsStr1) > 16384 of
+            true -> binary:part(DetailsStr1, 0, 16384);
+            false -> DetailsStr1
+        end,
+    StacktraceStr =
+        case byte_size(StacktraceStr1) > 16384 of
+            true -> binary:part(StacktraceStr1, 0, 16384);
+            false -> StacktraceStr1
+        end,
     ErrorMsg =
         #{
             <<"status">> => 500,
@@ -436,7 +523,12 @@ handle_error(Req, Singleton, Type, Details, Stacktrace, NodeMsg) ->
             <<"details">> => DetailsStr,
             <<"stacktrace">> => StacktraceStr
         },
-    ErrorBin = hb_format:error(ErrorMsg, NodeMsg),
+    ErrorMsg2 =
+        case DevNum of
+            undefined -> ErrorMsg;
+            _ -> ErrorMsg#{ <<"dev-num">> => DevNum, <<"device-info">> => InfoSummary }
+        end,
+    ErrorBin = hb_format:error(ErrorMsg2, NodeMsg),
     ?event(
         http_error,
         {returning_500_error,
@@ -448,13 +540,7 @@ handle_error(Req, Singleton, Type, Details, Stacktrace, NodeMsg) ->
             }
         }
     ),
-    % Remove leading and trailing noise from the stacktrace and details.
-    FormattedErrorMsg =
-        ErrorMsg#{
-            <<"stacktrace">> => hb_util:bin(hb_format:remove_noise(StacktraceStr)),
-            <<"details">> => hb_util:bin(hb_format:remove_noise(DetailsStr))
-        },
-    hb_http:reply(Req, Singleton, FormattedErrorMsg, NodeMsg).
+    hb_http:reply(Req, Singleton, ErrorMsg2, NodeMsg).
 
 %% @doc Return the list of allowed methods for the HTTP server.
 allowed_methods(Req, State) ->

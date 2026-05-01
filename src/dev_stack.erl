@@ -29,9 +29,9 @@
 %%% (its number if the stack is a list).
 %%% 
 %%% You can switch between fold and map modes by setting the `Mode' key in the
-%%% `Msg2' to either `Fold' or `Map', or set it globally for the stack by
-%%% setting the `Mode' key in the `Msg1' message. The key in `Msg2' takes
-%%% precedence over the key in `Msg1'.
+%%% `Req' to either `Fold' or `Map', or set it globally for the stack by
+%%% setting the `Mode' key in the `Base' message. The key in `Req' takes
+%%% precedence over the key in `Base'.
 %%%
 %%% The key that is called upon the device stack is the same key that is used
 %%% upon the devices that are contained within it. For example, in the above
@@ -82,11 +82,11 @@
 %%% even as it delegates calls to other devices. An example flow for a `dev_stack'
 %%% execution is as follows:
 %%% <pre>
-%%% 	/Msg1/AlicesExcitingKey ->
+%%% 	/Base/AlicesExcitingKey ->
 %%% 		dev_stack:execute ->
-%%% 			/Msg1/Set?device=/Device-Stack/1 ->
-%%% 			/Msg2/AlicesExcitingKey ->
-%%% 			/Msg3/Set?device=/Device-Stack/2 ->
+%%% 			/Base/Set?device=/Device-Stack/1 ->
+%%% 			/Req/AlicesExcitingKey ->
+%%% 			/Res/Set?device=/Device-Stack/2 ->
 %%% 			/Msg4/AlicesExcitingKey
 %%% 			... ->
 %%% 			/MsgN/Set?device=[This-Device] ->
@@ -117,44 +117,44 @@ info(Msg, Opts) ->
     ).
 
 %% @doc Return the default prefix for the stack.
-prefix(Msg1, _Msg2, Opts) ->
-    hb_ao:get(<<"output-prefix">>, {as, dev_message, Msg1}, <<"">>, Opts).
+prefix(Base, _Req, Opts) ->
+    hb_ao:get(<<"output-prefix">>, {as, dev_message, Base}, <<"">>, Opts).
 
 %% @doc Return the input prefix for the stack.
-input_prefix(Msg1, _Msg2, Opts) ->
-    hb_ao:get(<<"input-prefix">>, {as, dev_message, Msg1}, <<"">>, Opts).
+input_prefix(Base, _Req, Opts) ->
+    hb_ao:get(<<"input-prefix">>, {as, dev_message, Base}, <<"">>, Opts).
 
 %% @doc Return the output prefix for the stack.
-output_prefix(Msg1, _Msg2, Opts) ->
-    hb_ao:get(<<"output-prefix">>, {as, dev_message, Msg1}, <<"">>, Opts).
+output_prefix(Base, _Req, Opts) ->
+    hb_ao:get(<<"output-prefix">>, {as, dev_message, Base}, <<"">>, Opts).
 
 %% @doc The device stack key router. Sends the request to `resolve_stack',
 %% except for `set/2' which is handled by the default implementation in
 %% `dev_message'.
-router(<<"keys">>, Message1, Message2, Opts) ->
-	?event({keys_called, {msg1, Message1}, {msg2, Message2}}),
-	dev_message:keys(Message1, Opts);
-router(Key, Message1, Message2, Opts) ->
+router(<<"keys">>, Base, Request, Opts) ->
+	?event({keys_called, {base, Base}, {req, Request}}),
+	dev_message:keys(Base, Opts);
+router(Key, Base, Request, Opts) ->
     case hb_path:matches(Key, <<"transform">>) of
-        true -> transformer_message(Message1, Opts);
-        false -> router(Message1, Message2, Opts)
+        true -> transformer_message(Base, Opts);
+        false -> router(Base, Request, Opts)
     end.
-router(Message1, Message2, Opts) ->
-	?event({router_called, {msg1, Message1}, {msg2, Message2}}),
+router(Base, Request, Opts) ->
+	?event({router_called, {base, Base}, {req, Request}}),
     Mode =
-        case hb_ao:get(<<"mode">>, Message2, not_found, Opts) of
+        case hb_ao:get(<<"mode">>, Request, not_found, Opts) of
             not_found ->
                 hb_ao:get(
                     <<"mode">>,
-                    {as, dev_message, Message1},
+                    {as, dev_message, Base},
                     <<"Fold">>,
                     Opts
                 );
-            Msg2Mode -> Msg2Mode
+            ReqMode -> ReqMode
         end,
     case Mode of
-        <<"Fold">> -> resolve_fold(Message1, Message2, Opts);
-        <<"Map">> -> resolve_map(Message1, Message2, Opts)
+        <<"Fold">> -> resolve_fold(Base, Request, Opts);
+        <<"Map">> -> resolve_map(Base, Request, Opts)
     end.
 
 %% @doc Return a message which, when given a key, will transform the message
@@ -162,13 +162,13 @@ router(Message1, Message2, Opts) ->
 %% takes the place of the original `Device' key. This allows users to call
 %% a single device from the stack:
 %%
-%% 	/Msg1/Transform/DeviceName/keyInDevice ->
-%% 		keyInDevice executed on DeviceName against Msg1.
-transformer_message(Msg1, Opts) ->
-	?event({creating_transformer, {for, Msg1}}),
-    BaseInfo = info(Msg1, Opts),
+%% 	/Base/Transform/DeviceName/keyInDevice ->
+%% 		keyInDevice executed on DeviceName against Base.
+transformer_message(Base, Opts) ->
+	?event({creating_transformer, {for, Base}}),
+    BaseInfo = info(Base, Opts),
 	{ok, 
-		Msg1#{
+		Base#{
 			<<"device">> => #{
 				info =>
 					fun() ->
@@ -188,16 +188,17 @@ transformer_message(Msg1, Opts) ->
 		}
 	}.
 
-%% @doc Return Message1, transformed such that the device named `Key' from the
+%% @doc Return Base, transformed such that the device named `Key' from the
 %% `Device-Stack' key in the message takes the place of the original `Device'
 %% key. This transformation allows dev_stack to correctly track the HashPath
 %% of the message as it delegates execution to devices contained within it.
-transform(Msg1, Key, Opts) ->
-	% Get the device stack message from Msg1.
-    ?event({transforming_stack, {key, Key}, {msg1, Msg1}, {opts, Opts}}),
-	case hb_ao:get(<<"device-stack">>, {as, dev_message, Msg1}, Opts) of
+transform(Base, Key, Opts) ->
+	% Get the device stack message from Base.
+    ?event({transforming_stack, {key, Key}, {base, Base}, {opts, Opts}}),
+	{StackMsg, BaseWithStack} = ensure_device_stack(Base, Opts),
+	case StackMsg of
         not_found -> throw({error, no_valid_device_stack});
-        StackMsg ->
+        _ ->
 			% Find the requested key in the device stack.
             % TODO: Should we use `as dev_message` here? After the first transform
             % of a fold (for example), the message is no longer a stack, so its 
@@ -212,61 +213,279 @@ transform(Msg1, Key, Opts) ->
                     % - The prior prefixes for later restoration.
 					?event({activating_device, DevMsg}),
 					dev_message:set(
-                        Msg1,
+                        BaseWithStack,
 						#{
 							<<"device">> => DevMsg,
                             <<"device-key">> => Key,
                             <<"input-prefix">> =>
                                 hb_ao:get(
                                     [<<"input-prefixes">>, Key],
-                                    {as, dev_message, Msg1},
+                                    {as, dev_message, Base},
                                     undefined,
                                     Opts
                                 ),
                             <<"output-prefix">> =>
                                 hb_ao:get(
                                     [<<"output-prefixes">>, Key],
-                                    {as, dev_message, Msg1},
+                                    {as, dev_message, Base},
                                     undefined,
                                     Opts
                                 ),
                             <<"previous-device">> =>
                                 hb_ao:get(
                                     <<"device">>,
-                                    {as, dev_message, Msg1},
+                                    {as, dev_message, Base},
                                     Opts
                                 ),
                             <<"previous-input-prefix">> =>
                                 hb_ao:get(
                                     <<"input-prefix">>,
-                                    {as, dev_message, Msg1},
+                                    {as, dev_message, Base},
                                     undefined,
                                     Opts
                                 ),
                             <<"previous-output-prefix">> =>
                                 hb_ao:get(
                                     <<"output-prefix">>,
-                                    {as, dev_message, Msg1},
+                                    {as, dev_message, Base},
                                     undefined,
                                     Opts
                                 )
 						},
                         Opts
-                    );
+					);
 				_ ->
 					?event({no_device_key, Key, {stack, StackMsg}}),
 					not_found
 			end
 	end.
 
+ensure_device_stack(Base, Opts) ->
+	case hb_ao:get(<<"device-stack">>, {as, dev_message, Base}, not_found, Opts) of
+		not_found ->
+			case derive_device_stack_from_original_tags(Base, Opts) of
+				{ok, Derived} -> {Derived, Base#{ <<"device-stack">> => Derived }};
+				not_found -> {not_found, Base}
+			end;
+		StackMsg ->
+			{StackMsg, Base}
+	end.
+
+derive_device_stack_from_original_tags(Base, Opts) ->
+	Commitments0 =
+		case hb_ao:get([<<"process">>, <<"commitments">>], {as, dev_message, Base}, not_found, Opts) of
+			C when is_map(C), map_size(C) > 0 -> C;
+			_ -> hb_maps:get(<<"commitments">>, Base, #{}, Opts)
+		end,
+	Commitments = case is_map(Commitments0) of true -> Commitments0; false -> #{} end,
+	AllTags =
+		lists:flatten(
+			lists:map(
+				fun({_CommitId, Commitment}) ->
+					case hb_maps:get(<<"original-tags">>, Commitment, not_found, Opts) of
+						not_found ->
+							[];
+						Tags when is_map(Tags) ->
+							hb_maps:values(Tags, Opts);
+						Tags when is_list(Tags) ->
+							Tags;
+						_ ->
+							[]
+					end
+				end,
+				hb_maps:to_list(Commitments, Opts)
+			)
+		),
+	ExecutionStacks =
+		lists:filtermap(
+			fun(Tag) when is_map(Tag) ->
+				Name0 = hb_maps:get(<<"name">>, Tag, not_found, Opts),
+				Value0 = hb_maps:get(<<"value">>, Tag, not_found, Opts),
+				case {Name0, Value0} of
+					{not_found, _} -> false;
+					{_, not_found} -> false;
+					_ ->
+						Name = hb_util:to_lower(hb_util:bin(Name0)),
+						Value = hb_util:bin(Value0),
+						case Name of
+							<<"execution-stack">> -> {true, Value};
+							_ -> false
+						end
+				end;
+			(_) ->
+				false
+			end,
+			AllTags
+		),
+	IndexToDevice =
+		lists:foldl(
+			fun(Tag, Acc) when is_map(Tag) ->
+				Name0 = hb_maps:get(<<"name">>, Tag, not_found, Opts),
+				Value0 = hb_maps:get(<<"value">>, Tag, not_found, Opts),
+				case {Name0, Value0} of
+					{not_found, _} -> Acc;
+					{_, not_found} -> Acc;
+					_ ->
+						Name = hb_util:to_lower(hb_util:bin(Name0)),
+						Value = hb_util:bin(Value0),
+						case Name of
+							<<"device-stack/", Rest/binary>> ->
+								IdxBin =
+									case binary:split(Rest, <<"/">>, [global]) of
+										[First | _] -> First
+									end,
+								try binary_to_integer(IdxBin) of
+									Idx when is_integer(Idx), Idx > 0 ->
+										maps:put(Idx, Value, Acc)
+								catch
+									_:_ -> Acc
+								end;
+							_ ->
+								Acc
+						end
+				end;
+			(_, Acc) ->
+				Acc
+			end,
+			#{},
+			AllTags
+		),
+	case maps:size(IndexToDevice) of
+		0 ->
+			case ExecutionStacks of
+				[StackBin | _] ->
+					Parts0 = binary:split(StackBin, <<",">>, [global]),
+					Parts =
+						lists:filtermap(
+							fun(Part0) ->
+								Part = binary:trim(Part0, both, " \t\r\n"),
+								case Part of
+									<<>> -> false;
+									_ -> {true, Part}
+								end
+							end,
+							Parts0
+						),
+					case Parts of
+						[] -> not_found;
+						_ ->
+							{ok,
+								maps:from_list(
+									lists:zipwith(
+										fun(Idx, Dev) -> {integer_to_binary(Idx), Dev} end,
+										lists:seq(1, length(Parts)),
+										Parts
+									)
+								)}
+					end;
+				_ ->
+					not_found
+			end;
+		_ ->
+			Idxs = lists:sort(maps:keys(IndexToDevice)),
+			{ok,
+				maps:from_list(
+					[{integer_to_binary(I), maps:get(I, IndexToDevice)} || I <- Idxs]
+				)}
+	end.
+
 %% @doc The main device stack execution engine. See the moduledoc for more
 %% information.
-resolve_fold(Message1, Message2, Opts) ->
-	{ok, InitDevMsg} = dev_message:get(<<"device">>, Message1, Opts),
+maybe_surface_original_tags(Request, Opts) when is_map(Request) ->
+    % DrewFi uses scheduled ANS-104 assignments heavily. In some HyperBEAM
+    % execution paths, the request's `tags` may be omitted/emptied, while the
+    % verified ANS-104 tags are still preserved under commitment metadata
+    % (typically `commitments/*/original-tags`). Surface those tags back onto
+    % the request so Lua contracts can perform sender authorization based on
+    % From/From-Process.
+    %
+    % Important: many AO Lua contracts unwrap scheduler assignments by taking
+    % `body` (or `Body`) as the effective request message. Surface tags onto
+    % that nested body as well, otherwise contracts may observe empty tags.
+    Request1 = surface_tags_if_missing(Request, Opts),
+    Body0 =
+        case hb_maps:get(<<"body">>, Request1, not_found, Opts) of
+            not_found -> hb_maps:get(<<"Body">>, Request1, not_found, Opts);
+            V -> V
+        end,
+    case Body0 of
+        Body when is_map(Body) ->
+            Body1 = surface_tags_if_missing(Body, Opts),
+            case Body1 =:= Body of
+                true -> Request1;
+                false -> Request1#{ <<"body">> => Body1 }
+            end;
+        _ ->
+            Request1
+    end;
+maybe_surface_original_tags(Request, _Opts) ->
+    Request.
+
+surface_tags_if_missing(Request, Opts) ->
+    case hb_maps:get(<<"tags">>, Request, not_found, Opts) of
+        Tags when is_list(Tags), length(Tags) > 0 ->
+            Request;
+        Tags when is_map(Tags), map_size(Tags) > 0 ->
+            Request;
+        _ ->
+            surface_tags_from_commitments(Request, Opts)
+    end.
+
+surface_tags_from_commitments(Request, Opts) ->
+    Commitments0 = hb_maps:get(<<"commitments">>, Request, #{}, Opts),
+    Commitments = case is_map(Commitments0) of true -> Commitments0; false -> #{} end,
+    AllTags0 =
+        lists:flatten(
+            lists:map(
+                fun({_CommitId, Commitment}) when is_map(Commitment) ->
+                    case hb_maps:get(<<"original-tags">>, Commitment, not_found, Opts) of
+                        not_found ->
+                            [];
+                        Tags when is_map(Tags) ->
+                            hb_maps:values(Tags, Opts);
+                        Tags when is_list(Tags) ->
+                            Tags;
+                        _ ->
+                            []
+                    end;
+                (_) ->
+                    []
+                end,
+                hb_maps:to_list(Commitments, Opts)
+            )
+        ),
+    AllTags =
+        lists:sublist(
+            lists:filtermap(
+                fun(Tag) when is_map(Tag) ->
+                    Name = hb_maps:get(<<"name">>, Tag, not_found, Opts),
+                    Value = hb_maps:get(<<"value">>, Tag, not_found, Opts),
+                    case {Name, Value} of
+                        {not_found, _} -> false;
+                        {_, not_found} -> false;
+                        _ -> {true, Tag}
+                    end;
+                (_) ->
+                    false
+                end,
+                AllTags0
+            ),
+            200
+        ),
+    case AllTags of
+        [] ->
+            Request;
+        _ ->
+            Request#{ <<"tags">> => AllTags }
+    end.
+
+resolve_fold(Base, Request, Opts) ->
+	{ok, InitDevMsg} = dev_message:get(<<"device">>, Base, Opts),
+    Request2 = maybe_surface_original_tags(Request, Opts),
     StartingPassValue =
-        hb_ao:get(<<"pass">>, {as, dev_message, Message1}, unset, Opts),
-    PreparedMessage = hb_ao:set(Message1, <<"pass">>, 1, Opts),
-    case resolve_fold(PreparedMessage, Message2, 1, Opts) of
+        hb_ao:get(<<"pass">>, {as, dev_message, Base}, unset, Opts),
+    PreparedMessage = hb_ao:set(Base, <<"pass">>, 1, Opts),
+    case resolve_fold(PreparedMessage, Request2, 1, Opts) of
         {ok, Raw} when not is_map(Raw) ->
             {ok, Raw};
         {ok, Result} ->
@@ -297,17 +516,21 @@ resolve_fold(Message1, Message2, Opts) ->
         Else ->
             Else
     end.
-resolve_fold(Message1, Message2, DevNum, Opts) ->
-	case transform(Message1, DevNum, Opts) of
-		{ok, Message3} ->
-			?event({stack_execute, DevNum, {msg1, Message3}, {msg2, Message2}}),
-			case hb_ao:resolve(Message3, Message2, Opts) of
+resolve_fold(Base, Request, DevNum, Opts) ->
+	_ = file:write_file("/tmp/dev_stack.log", io_lib:format("~p resolve_fold dev=~p~n", [erlang:monotonic_time(millisecond), DevNum]), [append]),
+	case transform(Base, DevNum, Opts) of
+		{ok, Result} ->
+			?event({stack_execute, DevNum, {base, Result}, {req, Request}}),
+			_ = file:write_file("/tmp/dev_stack.log", io_lib:format("~p resolving dev=~p~n", [erlang:monotonic_time(millisecond), DevNum]), [append]),
+			Res = hb_ao:resolve(Result, Request, Opts),
+			_ = file:write_file("/tmp/dev_stack.log", io_lib:format("~p resolved dev=~p res=~p~n", [erlang:monotonic_time(millisecond), DevNum, element(1, Res)]), [append]),
+			case Res of
 				{ok, Message4} when is_map(Message4) ->
 					?event({result, ok, DevNum, Message4}),
-					resolve_fold(Message4, Message2, DevNum + 1, Opts);
+					resolve_fold(Message4, Request, DevNum + 1, Opts);
                 {error, not_found} ->
-                    ?event({skipping_device, not_found, DevNum, Message3}),
-                    resolve_fold(Message3, Message2, DevNum + 1, Opts);
+                    ?event({skipping_device, not_found, DevNum, Result}),
+                    resolve_fold(Result, Request, DevNum + 1, Opts);
                 {ok, RawResult} ->
                     ?event({returning_raw_result, RawResult}),
                     {ok, RawResult};
@@ -318,53 +541,53 @@ resolve_fold(Message1, Message2, DevNum, Opts) ->
                     ?event({result, pass, {dev, DevNum}, Message4}),
                     resolve_fold(
                         increment_pass(Message4, Opts),
-                        Message2,
+                        Request,
                         1,
                         Opts
                     );
 				{error, Info} ->
 					?event({result, error, {dev, DevNum}, Info}),
-					maybe_error(Message1, Message2, DevNum, Info, Opts);
+					maybe_error(Base, Request, DevNum, Info, Opts);
 				Unexpected ->
 					?event({result, unexpected, {dev, DevNum}, Unexpected}),
 					maybe_error(
-						Message1,
-						Message2,
+						Base,
+						Request,
 						DevNum,
 						{unexpected_result, Unexpected},
 						Opts
 					)
 			end;
 		not_found ->
-			?event({execution_complete, DevNum, Message1}),
-			{ok, Message1}
+			?event({execution_complete, DevNum, Base}),
+			{ok, Base}
 	end.
 
 %% @doc Map over the devices in the stack, accumulating the output in a single
 %% message of keys and values, where keys are the same as the keys in the
 %% original message (typically a number).
-resolve_map(Message1, Message2, Opts) ->
-    ?event({resolving_map, {msg1, Message1}, {msg2, Message2}}),
-    DevKeys =
-        hb_ao:get(
-            <<"device-stack">>,
-            {as, dev_message, Message1},
-            Opts
-        ),
-    Res = {ok,
-        hb_maps:filtermap(
-            fun(Key, _Dev) ->
-                {ok, OrigWithDev} = transform(Message1, Key, Opts),
-                case hb_ao:resolve(OrigWithDev, Message2, Opts) of
-                    {ok, Value} -> {true, Value};
-                    _ -> false
-                end
-            end,
-            hb_maps:without(?AO_CORE_KEYS, hb_ao:normalize_keys(DevKeys, Opts), Opts),
-			Opts
-        )
-    },
-    Res.
+resolve_map(Base, Request, Opts) ->
+    ?event({resolving_map, {base, Base}, {req, Request}}),
+    Request2 = maybe_surface_original_tags(Request, Opts),
+    {DevKeys0, Base2} = ensure_device_stack(Base, Opts),
+    case DevKeys0 of
+        not_found ->
+            {ok, #{}};
+        _ ->
+            {ok,
+                hb_maps:filtermap(
+                    fun(Key, _Dev) ->
+                        {ok, OrigWithDev} = transform(Base2, Key, Opts),
+                        case hb_ao:resolve(OrigWithDev, Request2, Opts) of
+                            {ok, Value} -> {true, Value};
+                            _ -> false
+                        end
+                    end,
+                    hb_maps:without(?AO_CORE_KEYS, hb_ao:normalize_keys(DevKeys0, Opts), Opts),
+                    Opts
+                )
+            }
+    end.
 
 %% @doc Helper to increment the pass number.
 increment_pass(Message, Opts) ->
@@ -374,17 +597,17 @@ increment_pass(Message, Opts) ->
         Opts
     ).
 
-maybe_error(Message1, Message2, DevNum, Info, Opts) ->
+maybe_error(Base, Request, DevNum, Info, Opts) ->
     case hb_opts:get(error_strategy, throw, Opts) of
         stop ->
-			{error, {stack_call_failed, Message1, Message2, DevNum, Info}};
+			{error, {stack_call_failed, Base, Request, DevNum, Info}};
         throw ->
 			erlang:raise(
                 error,
                 {device_failed,
                     {dev_num, DevNum},
-                    {msg1, Message1},
-                    {msg2, Message2},
+                    {base, Base},
+                    {req, Request},
                     {info, Info}
                 },
                 []
@@ -413,7 +636,7 @@ generate_append_device(Separator, Status) ->
 %% by other functions in the module.
 transform_internal_call_device_test() ->
 	AppendDev = generate_append_device(<<"_">>),
-	Msg1 =
+	Base =
 		#{
 			<<"device">> => <<"stack@1.0">>,
 			<<"device-stack">> =>
@@ -426,14 +649,14 @@ transform_internal_call_device_test() ->
 		<<"message@1.0">>,
 		hb_ao:get(
 			<<"device">>,
-			element(2, transform(Msg1, <<"2">>, #{}))
+			element(2, transform(Base, <<"2">>, #{}))
 		)
 	).
 
 %% @doc Ensure we can generate a transformer message that can be called to
-%% return a version of msg1 with only that device attached.
+%% return a version of base with only that device attached.
 transform_external_call_device_test() ->
-	Msg1 = #{
+	Base = #{
 		<<"device">> => <<"stack@1.0">>,
 		<<"device-stack">> =>
 			#{
@@ -466,7 +689,7 @@ transform_external_call_device_test() ->
 	},
 	?assertMatch(
 		{ok, #{ <<"value">> := <<"Super-Cool">> }},
-		hb_ao:resolve(Msg1, #{
+		hb_ao:resolve(Base, #{
 			<<"path">> => <<"/transform/make-cool/value">>
 		}, #{})
 	).
@@ -586,69 +809,69 @@ test_prefix_msg() ->
     }.
 
 no_prefix_test() ->
-    Msg2 =
+    Req =
         #{
             <<"path">> => <<"prefix_set">>,
             <<"key">> => <<"example">>,
             <<"example">> => 1
         },
-    {ok, Ex1Msg3} = hb_ao:resolve(test_prefix_msg(), Msg2, #{}),
-    ?event({ex1, Ex1Msg3}),
-    ?assertMatch(1, hb_ao:get(<<"example">>, Ex1Msg3, #{})).
+    {ok, Ex1Res} = hb_ao:resolve(test_prefix_msg(), Req, #{}),
+    ?event({ex1, Ex1Res}),
+    ?assertMatch(1, hb_ao:get(<<"example">>, Ex1Res, #{})).
 
 output_prefix_test() ->
-    Msg1 =
+    Base =
         (test_prefix_msg())#{
             <<"output-prefixes">> => #{ <<"1">> => <<"out1/">>, <<"2">> => <<"out2/">> }
         },
-    Msg2 =
+    Req =
         #{
             <<"path">> => <<"prefix_set">>,
             <<"key">> => <<"example">>,
             <<"example">> => 1
         },
-    {ok, Ex2Msg3} = hb_ao:resolve(Msg1, Msg2, #{}),
+    {ok, Ex2Res} = hb_ao:resolve(Base, Req, #{}),
     ?assertMatch(1,
-        hb_ao:get(<<"out1/example">>, {as, dev_message, Ex2Msg3}, #{})),
+        hb_ao:get(<<"out1/example">>, {as, dev_message, Ex2Res}, #{})),
     ?assertMatch(1,
-        hb_ao:get(<<"out2/example">>, {as, dev_message, Ex2Msg3}, #{})).
+        hb_ao:get(<<"out2/example">>, {as, dev_message, Ex2Res}, #{})).
 
 input_and_output_prefixes_test() ->
-    Msg1 =
+    Base =
         (test_prefix_msg())#{
             <<"input-prefixes">> => #{ 1 => <<"in1/">>, 2 => <<"in2/">> },
             <<"output-prefixes">> => #{ 1 => <<"out1/">>, 2 => <<"out2/">> }
         },
-    Msg2 =
+    Req =
         #{
             <<"path">> => <<"prefix_set">>,
             <<"key">> => <<"example">>,
             <<"in1">> => #{ <<"example">> => 1 },
             <<"in2">> => #{ <<"example">> => 2 }
         },
-    {ok, Msg3} = hb_ao:resolve(Msg1, Msg2, #{}),
+    {ok, Res} = hb_ao:resolve(Base, Req, #{}),
     ?assertMatch(1,
-        hb_ao:get(<<"out1/example">>, {as, dev_message, Msg3}, #{})),
+        hb_ao:get(<<"out1/example">>, {as, dev_message, Res}, #{})),
     ?assertMatch(2,
-        hb_ao:get(<<"out2/example">>, {as, dev_message, Msg3}, #{})).
+        hb_ao:get(<<"out2/example">>, {as, dev_message, Res}, #{})).
 
 input_output_prefixes_passthrough_test() ->
-    Msg1 =
+    Base =
         (test_prefix_msg())#{
             <<"output-prefix">> => <<"combined-out/">>,
             <<"input-prefix">> => <<"combined-in/">>
         },
-    Msg2 =
+    Req =
         #{
             <<"path">> => <<"prefix_set">>,
             <<"key">> => <<"example">>,
             <<"combined-in">> => #{ <<"example">> => 1 }
         },
-    {ok, Ex2Msg3} = hb_ao:resolve(Msg1, Msg2, #{}),
+    {ok, Ex2Res} = hb_ao:resolve(Base, Req, #{}),
     ?assertMatch(1,
         hb_ao:get(
             <<"combined-out/example">>,
-            {as, dev_message, Ex2Msg3},
+            {as, dev_message, Ex2Res},
             #{}
         )
     ).
@@ -668,15 +891,15 @@ reinvocation_test() ->
 		{ok, #{ <<"result">> := <<"INIT+D12+D22">> }},
 		Res1
 	),
-	{ok, Msg2} = Res1,
-	Res2 = hb_ao:resolve(Msg2, #{ <<"path">> => <<"append">>, <<"bin">> => <<"3">> }, #{}),
+	{ok, Req} = Res1,
+	Res2 = hb_ao:resolve(Req, #{ <<"path">> => <<"append">>, <<"bin">> => <<"3">> }, #{}),
 	?assertMatch(
 		{ok, #{ <<"result">> := <<"INIT+D12+D22+D13+D23">> }},
 		Res2
 	).
 
 skip_test() ->
-	Msg1 = #{
+	Base = #{
 		<<"device">> => <<"stack@1.0">>,
 		<<"device-stack">> =>
 			#{
@@ -688,7 +911,7 @@ skip_test() ->
 	?assertMatch(
 		{ok, #{ <<"result">> := <<"INIT+D12">> }},
 		hb_ao:resolve(
-			Msg1,
+			Base,
 			#{ <<"path">> => <<"append">>, <<"bin">> => <<"2">> },
             #{}
 		)
@@ -728,13 +951,13 @@ not_found_test() ->
 			},
 		<<"result">> => <<"INIT">>
 	},
-    {ok, Msg3} = hb_ao:resolve(Msg, #{ <<"path">> => <<"append">>, <<"bin">> => <<"_">> }, #{}),
+    {ok, Res} = hb_ao:resolve(Msg, #{ <<"path">> => <<"append">>, <<"bin">> => <<"_">> }, #{}),
     ?assertMatch(
 		#{ <<"result">> := <<"INIT+D1_+D2_">> },
-		Msg3
+		Res
 	),
-    ?event({ex3, Msg3}),
-    ?assertEqual(1337, hb_ao:get(<<"special/output">>, Msg3, #{})).
+    ?event({ex3, Res}),
+    ?assertEqual(1337, hb_ao:get(<<"special/output">>, Res, #{})).
 
 simple_map_test() ->
     Msg = #{
@@ -746,11 +969,11 @@ simple_map_test() ->
             },
         <<"result">> => <<"INIT">>
     },
-    {ok, Msg3} =
+    {ok, Res} =
         hb_ao:resolve(
             Msg,
             #{ <<"path">> => <<"append">>, <<"mode">> => <<"Map">>, <<"bin">> => <<"/">> },
             #{}
         ),
-    ?assertMatch(<<"INIT+D1/">>, hb_ao:get(<<"1/result">>, Msg3, #{})),
-    ?assertMatch(<<"INIT+D2/">>, hb_ao:get(<<"2/result">>, Msg3, #{})).
+    ?assertMatch(<<"INIT+D1/">>, hb_ao:get(<<"1/result">>, Res, #{})),
+    ?assertMatch(<<"INIT+D2/">>, hb_ao:get(<<"2/result">>, Res, #{})).

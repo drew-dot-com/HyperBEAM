@@ -65,6 +65,7 @@ read(Path) ->
 %% @doc Write a value to the specified path in the store.
 write(Opts, PathComponents, Value) ->
     Path = add_prefix(Opts, PathComponents),
+    log_write_debug(Opts, PathComponents, Path, Value),
     ?event({writing, Path, byte_size(Value)}),
     filelib:ensure_dir(Path),
     ok = file:write_file(Path, Value).
@@ -192,3 +193,19 @@ add_prefix(#{ <<"name">> := Prefix }, Path) ->
 %% @doc Remove the directory prefix from a path.
 remove_prefix(#{ <<"name">> := Prefix }, Path) ->
     hb_util:remove_common(Path, Prefix).
+
+log_write_debug(Opts, PathComponents, Path, Value) ->
+    ValueSize =
+        case is_binary(Value) of
+            true -> byte_size(Value);
+            false ->
+                case is_list(Value) of
+                    true -> length(Value);
+                    false -> undefined
+                end
+        end,
+    ?event({fs_write_debug,
+        {opts, Opts},
+        {path_components, PathComponents},
+        {path, Path},
+        {value_size, ValueSize}}).

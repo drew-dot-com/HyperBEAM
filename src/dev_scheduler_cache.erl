@@ -89,21 +89,61 @@ read(ProcID, Slot, RawOpts) ->
     ),
     ?event({resolved_path, {p1, P1}, {p2, P2}, {resolved, ResolvedPath}}),
     case hb_cache:read(ResolvedPath, Opts) of
-        {ok, Assignment} ->
+        {ok, Assignment} when is_map(Assignment) ->
             % If the slot key is not present, the format of the assignment is
             % AOS2, so we need to convert it to the canonical format.
-            case hb_ao:get(<<"variant">>, Assignment, Opts) of
+            Variant0 = (catch hb_ao:get(<<"variant">>, Assignment, Opts)),
+            Variant =
+                case Variant0 of
+                    {'EXIT', _} -> not_found;
+                    _ -> Variant0
+                end,
+            case Variant of
+                not_found ->
+                    normalize_cached_assignment(Assignment, Opts);
                 <<"ao.TN.1">> ->
-                    Loaded = hb_cache:ensure_all_loaded(Assignment, Opts),
-                    Norm = dev_scheduler_formats:aos2_to_assignment(Loaded, Opts),
-                    ?event({normalized_aos2_assignment, Norm}),
-                    {ok, Norm};
+                    normalize_cached_assignment(Assignment, Opts);
                 <<"ao.N.1">> ->
-                    {ok, hb_cache:ensure_all_loaded(Assignment, Opts)}
+                    Loaded = hb_cache:ensure_all_loaded(Assignment, Opts),
+                    case is_map(Loaded) of
+                        true -> {ok, Loaded};
+                        false -> {ok, Assignment}
+                    end;
+                _ ->
+                    {ok, Assignment}
             end;
+        {ok, Assignment} ->
+            {ok, Assignment};
         not_found ->
             ?event(debug_sched, {read_assignment, {res, not_found}}),
             not_found
+    end.
+
+normalize_cached_assignment(Assignment, Opts) ->
+    % Some cached assignments may be missing `variant` and/or contain unresolved
+    % lazy links or malformed payloads. Never crash the scheduler for this.
+	    try
+	        Loaded0 = hb_cache:ensure_all_loaded(Assignment, Opts),
+	        Loaded =
+	            case Loaded0 of
+	                LoadedMap0 when is_map(LoadedMap0) -> LoadedMap0;
+	                _ -> Assignment
+	            end,
+	        case Loaded of
+	            LoadedMap when is_map(LoadedMap) ->
+	                Norm0 = dev_scheduler_formats:aos2_to_assignment(LoadedMap, Opts),
+	                Norm =
+	                    case Norm0 of
+	                        NormMap when is_map(NormMap) -> NormMap;
+	                        _ -> LoadedMap
+	                    end,
+	                ?event({normalized_aos2_assignment, Norm}),
+	                {ok, Norm};
+	            _ ->
+	                {ok, Assignment}
+        end
+    catch _:_ ->
+        {ok, Assignment}
     end.
 
 %% @doc Get the assignments for a process.
@@ -127,23 +167,41 @@ latest(ProcID, RawOpts) ->
             ?event({no_assignments_in_cache, {proc_id, ProcID}}),
             not_found;
         Assignments ->
-            AssignmentNum = lists:max(Assignments),
-            ?event(
-                {found_assignment_from_cache,
-                    {proc_id, ProcID},
-                    {assignment_num, AssignmentNum}
-                }
-            ),
-            {ok, Assignment} = dev_scheduler_cache:read(
-                ProcID,
-                AssignmentNum,
-                Opts
-            ),
-            {
-                AssignmentNum,
-                hb_ao:get(
-                    <<"hash-chain">>, Assignment, #{ hashpath => ignore })
-            }
+            case latest_readable_assignment(ProcID, Assignments, Opts) of
+                not_found ->
+                    ?event({no_readable_assignments_in_cache, {proc_id, ProcID}}),
+                    not_found;
+                {ok, AssignmentNum, Assignment} ->
+                    ?event(
+                        {found_assignment_from_cache,
+                            {proc_id, ProcID},
+                            {assignment_num, AssignmentNum}
+                        }
+                    ),
+                    {
+                        AssignmentNum,
+                        hb_ao:get_first(
+                            [
+                                {Assignment, <<"base-hashpath">>},
+                                {Assignment, <<"hash-chain">>}
+                            ],
+                            #{ hashpath => ignore }
+                        )
+                    }
+            end
+    end.
+
+latest_readable_assignment(_ProcID, [], _Opts) ->
+    not_found;
+latest_readable_assignment(ProcID, Assignments, Opts) when is_list(Assignments) ->
+    AssignmentNum = lists:max(Assignments),
+    case dev_scheduler_cache:read(ProcID, AssignmentNum, Opts) of
+        {ok, Assignment} ->
+            {ok, AssignmentNum, Assignment};
+        not_found ->
+            latest_readable_assignment(ProcID, lists:delete(AssignmentNum, Assignments), Opts);
+        {error, _} ->
+            latest_readable_assignment(ProcID, lists:delete(AssignmentNum, Assignments), Opts)
     end.
 
 %% @doc Read the latest known scheduler location for an address.
@@ -226,7 +284,8 @@ volatile_schedule_test() ->
     },
     ?assertEqual(ok, write(Assignment, Opts)),
     ?assertMatch({1, _}, latest(ProcID, Opts)),
-    ?assertEqual({ok, Assignment}, read(ProcID, 1, Opts)),
+    {ok, ReadAssignment} = read(ProcID, 1, Opts),
+    ?assertEqual(ReadAssignment, hb_message:normalize_commitments(Assignment, Opts)),
     hb_store:stop(VolStore),
     hb_store:reset(VolStore),
     hb_store:start(VolStore),

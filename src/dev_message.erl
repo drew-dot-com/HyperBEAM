@@ -88,17 +88,16 @@ id(Base, _, NodeOpts) when is_binary(Base) ->
     % Return the hashpath of the message in native format, to match the native
     % format of the message ID return.
     {ok, hb_util:human_id(hb_path:hashpath(Base, NodeOpts))};
+id(List, Req, NodeOpts) when is_list(List) ->
+    % Return the list of IDs for a list of messages.
+    id(hb_message:convert(List, tabm, NodeOpts), Req, NodeOpts);
 id(RawBase, Req, NodeOpts) ->
     % Ensure that the base message is normalized before proceeding.
     IDOpts = NodeOpts#{ linkify_mode => discard },
-    Base =
-        ensure_commitments_loaded(
-            hb_message:convert(RawBase, tabm, IDOpts),
-            NodeOpts
-        ),
+    Base = ensure_commitments_loaded(RawBase, NodeOpts),
     % Remove the commitments from the base message if there are none, after
     % filtering for the committers specified in the request.
-    ModBase = #{ <<"commitments">> := Commitments }
+    #{ <<"commitments">> := Commitments }
         = with_relevant_commitments(Base, Req, IDOpts),
     ?event(debug_commitments,
         {generating_ids,
@@ -111,7 +110,7 @@ id(RawBase, Req, NodeOpts) ->
         [] ->
             % If there are no commitments, we must (re)calculate the ID.
             ?event(debug_id, no_commitments_found_in_id_call),
-            calculate_id(hb_maps:without([<<"commitments">>], ModBase), Req, IDOpts);
+            calculate_id(hb_maps:without([<<"commitments">>], Base), Req, IDOpts);
         IDs ->
             % Accumulate the relevant IDs into a single value. This is performed 
             % by module arithmetic of each of the IDs. The effect of this is that:
@@ -135,8 +134,9 @@ id(RawBase, Req, NodeOpts) ->
             }
     end.
 
-calculate_id(Base, Req, NodeOpts) ->
+calculate_id(RawBase, Req, NodeOpts) ->
     % Find the ID device for the message.
+    Base = hb_message:convert(RawBase, tabm, NodeOpts),
     ?event(linkify, {calculate_ids, {base, Base}}),
     IDMod =
         case id_device(Base, NodeOpts) of
@@ -218,16 +218,19 @@ id_device(_, _) ->
 committers(Base) -> committers(Base, #{}).
 committers(Base, Req) -> committers(Base, Req, #{}).
 committers(#{ <<"commitments">> := Commitments }, _, NodeOpts) ->
-    ?event(debug_commitments, {calculating_committers, {commitments, Commitments}}),
     {ok,
         hb_maps:values(
             hb_maps:filtermap(
-                fun(_ID, Commitment) ->
-                    Committer = maps:get(<<"committer">>, Commitment, undefined),
-                    ?event(debug_commitments, {committers, {committer, Committer}}),
-                    case Committer of
-                        undefined -> false;
-                        Committer -> {true, Committer}
+                fun(_ID, Commitment0) ->
+                    Commitment = hb_cache:ensure_loaded(Commitment0, NodeOpts),
+                    case Commitment of
+                        M when is_map(M) ->
+                            case maps:get(<<"committer">>, M, undefined) of
+                                undefined -> false;
+                                Committer -> {true, Committer}
+                            end;
+                        _ ->
+                            false
                     end
                 end,
                 Commitments,
@@ -260,8 +263,19 @@ commit(Self, Req, Opts) ->
             _ ->
                 Opts#{ linkify_mode => offload }
         end,
-    AttMod = hb_ao_device:message_to_device(#{ <<"device">> => AttDev }, CommitOpts),
-    {ok, AttFun} = hb_ao_device:find_exported_function(Base, AttMod, commit, 3, CommitOpts),
+    AttMod =
+        hb_ao_device:message_to_device(
+            #{ <<"device">> => AttDev },
+            CommitOpts
+        ),
+    {ok, AttFun} =
+        hb_ao_device:find_exported_function(
+            Base,
+            AttMod,
+            commit,
+            3,
+            CommitOpts
+        ),
     % Encode to a TABM
     Loaded =
         ensure_commitments_loaded(
@@ -384,17 +398,42 @@ committed(Self, Req, Opts) ->
     ),
     Commitments = maps:get(<<"commitments">>, Base, #{}),
     % Get the list of committed keys from each committer.
+    %
+    % NOTE: some messages carry nested/non-standard commitment maps (e.g. a
+    % wrapper map whose values contain the actual commitment entries). Avoid
+    % crashing and extract only entries that actually contain `committed`.
     CommitmentKeys =
-        lists:map(
+        lists:flatmap(
             fun(CommitmentID) ->
-                Commitment = maps:get(CommitmentID, Commitments),
-                % The committed keys will be a TABM encoded numbered map
-                % so we must decode it to its underlying list of normalized keys
-                % for comparison purposes.
-                hb_util:message_to_ordered_list(
-                    maps:get(<<"committed">>, Commitment),
-                    Opts
-                )
+                Commitment0 = maps:get(CommitmentID, Commitments, #{}),
+                Commitment = hb_cache:ensure_loaded(Commitment0, Opts),
+                case Commitment of
+                    #{ <<"committed">> := Committed } ->
+                        [
+                            hb_util:message_to_ordered_list(
+                                Committed,
+                                Opts
+                            )
+                        ];
+                    Map when is_map(Map) ->
+                        lists:filtermap(
+                            fun(V) ->
+                                V2 = hb_cache:ensure_loaded(V, Opts),
+                                case V2 of
+                                    #{ <<"committed">> := C } ->
+                                        {true,
+                                            hb_util:message_to_ordered_list(
+                                                C,
+                                                Opts
+                                            )};
+                                    _ -> false
+                                end
+                            end,
+                            maps:values(Map)
+                        );
+                    _ ->
+                        []
+                end
             end,
             CommitmentIDs
         ),
@@ -460,7 +499,7 @@ commitment_ids_from_request(Base, Req, Opts) ->
             X when is_list(X) -> X;
             CommitterDescriptor -> hb_ao:normalize_key(CommitterDescriptor)
         end,
-    RawReqCommitments = maps:get(<<"commitments">>, Req, <<"none">>),
+    RawReqCommitments = maps:get(<<"commitment-ids">>, Req, <<"none">>),
     ReqCommitments =
         case RawReqCommitments of
             X2 when is_list(X2) -> X2;
@@ -487,7 +526,6 @@ commitment_ids_from_request(Base, Req, Opts) ->
                 ?event(no_commitment_ids_for_committers),
                 [];
             <<"all">> ->
-                ?event(debug_commitments, {getting_commitment_ids_for_all_committers}),
                 {ok, Committers} = committers(Base, Req, Opts),
                 ?event(debug_commitments, {commitment_ids_from_committers, Committers}),
                 commitment_ids_from_committers(Committers, Commitments, Opts);
@@ -507,12 +545,18 @@ commitment_ids_from_request(Base, Req, Opts) ->
                 % commitment device, if it exists.
                 lists:filter(
                     fun(CommitmentID) ->
-                        Comm = maps:get(CommitmentID, Commitments),
-                        Dev = maps:get(<<"commitment-device">>, Comm, undefined),
-                        case Dev of
-                            ?DEFAULT_ATT_DEVICE ->
-                                not hb_maps:is_key(<<"committer">>, Comm);
-                            _ -> false
+                        Comm0 = maps:get(CommitmentID, Commitments),
+                        Comm = hb_cache:ensure_loaded(Comm0, Opts),
+                        case Comm of
+                            M when is_map(M) ->
+                                Dev = maps:get(<<"commitment-device">>, M, undefined),
+                                case Dev of
+                                    ?DEFAULT_ATT_DEVICE ->
+                                        not hb_maps:is_key(<<"committer">>, M);
+                                    _ -> false
+                                end;
+                            _ ->
+                                false
                         end
                     end,
                     maps:keys(Commitments)
@@ -524,11 +568,9 @@ commitment_ids_from_request(Base, Req, Opts) ->
 
 %% @doc Ensure that the `commitments` submessage of a base message is fully
 %% loaded into local memory.
-ensure_commitments_loaded(NonRelevant, _Opts) when not is_map(NonRelevant) ->
-    NonRelevant;
-ensure_commitments_loaded(M = #{ <<"commitments">> := Link}, Opts) when ?IS_LINK(Link) ->
+ensure_commitments_loaded(M = #{ <<"commitments">> := L}, Opts) when ?IS_LINK(L) ->
     M#{
-        <<"commitments">> => hb_cache:ensure_all_loaded(Link, Opts)
+        <<"commitments">> => hb_cache:ensure_all_loaded(L, Opts)
     };
 ensure_commitments_loaded(M, _Opts) ->
     M.
@@ -588,8 +630,8 @@ commitment_ids_from_committers(CommitterAddrs, Commitments, Opts) ->
 
 %% @doc Deep merge keys in a message. Takes a map of key-value pairs and sets
 %% them in the message, overwriting any existing values.
-set(Message1, NewValuesMsg, Opts) ->
-    OriginalPriv = hb_private:from_message(Message1),
+set(Base, NewValuesMsg, Opts) ->
+    OriginalPriv = hb_private:from_message(Base),
 	% Filter keys that are in the default device (this one).
     {ok, NewValuesKeys} = keys(NewValuesMsg, Opts),
 	KeysToSet =
@@ -605,7 +647,7 @@ set(Message1, NewValuesMsg, Opts) ->
 	ConflictingKeys =
 		lists:filter(
 			fun(Key) -> lists:member(Key, KeysToSet) end,
-			hb_maps:keys(Message1, Opts)
+			hb_maps:keys(Base, Opts)
 		),
     UnsetKeys =
         lists:filter(
@@ -615,16 +657,16 @@ set(Message1, NewValuesMsg, Opts) ->
                     _ -> false
                 end
             end,
-            hb_maps:keys(Message1, Opts)
+            hb_maps:keys(Base, Opts)
         ),
     % Base message with keys-to-unset removed
-    BaseValues = hb_maps:without(UnsetKeys, Message1, Opts),
+    BaseValues = hb_maps:without(UnsetKeys, Base, Opts),
     ?event(message_set,
         {performing_set,
             {conflicting_keys, ConflictingKeys},
             {keys_to_unset, UnsetKeys},
             {new_values, NewValuesMsg},
-            {original_message, Message1}
+            {original_message, Base}
         }
     ),
     % Create the map of new values
@@ -643,7 +685,7 @@ set(Message1, NewValuesMsg, Opts) ->
     % Caclulate if the keys to be set conflict with any committed keys.
     {ok, CommittedKeys} =
         committed(
-            Message1,
+            Base,
             #{
                 <<"committers">> => <<"all">>
             },
@@ -653,7 +695,7 @@ set(Message1, NewValuesMsg, Opts) ->
         {setting,
             {committed_keys, CommittedKeys},
             {keys_to_set, KeysToSet},
-            {message, Message1}
+            {message, Base}
         }
     ),
     OverwrittenCommittedKeys =
@@ -686,7 +728,7 @@ set(Message1, NewValuesMsg, Opts) ->
         _ ->
             % We did overwrite some keys, but do their values match the original?
             % If not, we must remove the commitments.
-            case hb_message:match(Merged, Message1, Opts) of
+            case hb_message:match(Merged, Base, strict, Opts) of
                 true ->
                     ?event(message_set, {set_keys_matched, {merged, Merged}}),
                     {ok, Merged};
@@ -775,13 +817,13 @@ set_path(Base, Value, Opts) when not is_map(Value) ->
     end.
 
 %% @doc Remove a key or keys from a message.
-remove(Message1, Key) ->
-	remove(Message1, Key, #{}).
+remove(Base, Key) ->
+	remove(Base, Key, #{}).
 
-remove(Message1, #{ <<"item">> := Key }, Opts) ->
-    remove(Message1, #{ <<"items">> => [Key] }, Opts);
-remove(Message1, #{ <<"items">> := Keys }, Opts) ->
-    { ok, hb_maps:without(Keys, Message1, Opts) }.
+remove(Base, #{ <<"item">> := Key }, Opts) ->
+    remove(Base, #{ <<"items">> => [Key] }, Opts);
+remove(Base, #{ <<"items">> := Keys }, Opts) ->
+    { ok, hb_maps:without(Keys, Base, Opts) }.
 
 %% @doc Get the public keys of a message.
 keys(Msg) ->
@@ -805,7 +847,7 @@ keys(Msg, Opts) ->
 %% underlying Erlang map. First check the public keys, then check case-
 %% insensitively if the key is a binary.
 get(Key, Msg, Opts) -> get(Key, Msg, #{ <<"path">> => <<"get">> }, Opts).
-get(Key, Msg, _Msg2, Opts) ->
+get(Key, Msg, _Req, Opts) ->
     case hb_private:is_private(Key) of
         true -> {error, not_found};
         false ->
@@ -889,48 +931,48 @@ remove_test() ->
     ).
 
 set_conflicting_keys_test() ->
-	Msg1 = #{ <<"dangerous">> => <<"Value1">> },
-	Msg2 = #{ <<"path">> => <<"set">>, <<"dangerous">> => <<"Value2">> },
+	Base = #{ <<"dangerous">> => <<"Value1">> },
+	Req = #{ <<"path">> => <<"set">>, <<"dangerous">> => <<"Value2">> },
 	?assertMatch({ok, #{ <<"dangerous">> := <<"Value2">> }},
-		hb_ao:resolve(Msg1, Msg2, #{})).
+		hb_ao:resolve(Base, Req, #{})).
 
 unset_with_set_test() ->
-	Msg1 = #{ <<"dangerous">> => <<"Value1">> },
-	Msg2 = #{ <<"path">> => <<"set">>, <<"dangerous">> => unset },
-	?assertMatch({ok, Msg3} when ?IS_EMPTY_MESSAGE(Msg3),
-		hb_ao:resolve(Msg1, Msg2, #{ hashpath => ignore })).
+	Base = #{ <<"dangerous">> => <<"Value1">> },
+	Req = #{ <<"path">> => <<"set">>, <<"dangerous">> => unset },
+	?assertMatch({ok, Res} when ?IS_EMPTY_MESSAGE(Res),
+		hb_ao:resolve(Base, Req, #{ hashpath => ignore })).
 
 deep_unset_test() ->
     Opts = #{ hashpath => ignore },
-    Msg1 = #{
+    Base = #{
         <<"test-key1">> => <<"Value1">>,
         <<"deep">> => #{
             <<"test-key2">> => <<"Value2">>,
             <<"test-key3">> => <<"Value3">>
         }
     },
-    Msg2 = hb_ao:set(Msg1, #{ <<"deep/test-key2">> => unset }, Opts),
+    Req = hb_ao:set(Base, #{ <<"deep/test-key2">> => unset }, Opts),
     ?assertEqual(#{
             <<"test-key1">> => <<"Value1">>,
             <<"deep">> => #{ <<"test-key3">> => <<"Value3">> }
         },
-        Msg2
+        Req
     ),
-    Msg3 = hb_ao:set(Msg2, <<"deep/test-key3">>, unset, Opts),
+    Res = hb_ao:set(Req, <<"deep/test-key3">>, unset, Opts),
     ?assertEqual(#{
             <<"test-key1">> => <<"Value1">>,
             <<"deep">> => #{}
         },
-        Msg3
+        Res
     ),
-    Msg4 = hb_ao:set(Msg3, #{ <<"deep">> => unset }, Opts),
+    Msg4 = hb_ao:set(Res, #{ <<"deep">> => unset }, Opts),
     ?assertEqual(#{ <<"test-key1">> => <<"Value1">> }, Msg4).
 
 set_ignore_undefined_test() ->
-	Msg1 = #{ <<"test-key">> => <<"Value1">> },
-	Msg2 = #{ <<"path">> => <<"set">>, <<"test-key">> => undefined },
+	Base = #{ <<"test-key">> => <<"Value1">> },
+	Req = #{ <<"path">> => <<"set">>, <<"test-key">> => undefined },
 	?assertEqual(#{ <<"test-key">> => <<"Value1">> },
-		hb_private:reset(hb_util:ok(set(Msg1, Msg2, #{ hashpath => ignore })))).
+		hb_private:reset(hb_util:ok(set(Base, Req, #{ hashpath => ignore })))).
 
 verify_test() ->
     Unsigned = #{ <<"a">> => <<"b">> },

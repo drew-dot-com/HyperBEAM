@@ -43,7 +43,104 @@ is_operator(Request, NodeMsg) ->
             unclaimed -> unclaimed;
             NativeAddress -> hb_util:human_id(NativeAddress)
         end,
-    EncOperator == unclaimed orelse lists:member(EncOperator, RequestSigners).
+    EncOperator == unclaimed orelse lists:member(EncOperator, RequestSigners) orelse publickey_signer_matches_operator(RequestSigners, EncOperator).
+
+
+publickey_signer_matches_operator(RequestSigners, EncOperator) ->
+    lists:any(
+        fun(Signer) ->
+            case Signer of
+                <<"publickey:", Rest/binary>> ->
+                    try
+                        Pub = base64:decode(Rest),
+                        Derived = hb_util:human_id(crypto:hash(sha256, Pub)),
+                        Derived == EncOperator
+                    catch
+                        _:_ -> false
+                    end;
+                _ ->
+                    false
+            end
+        end,
+        RequestSigners
+    ).
+
+
+extract_signature_keyid(RawRequest) ->
+    SigInput = maps:get(<<"signature-input">>, RawRequest, undefined),
+    case SigInput of
+        Bin when is_binary(Bin) ->
+            case binary:match(Bin, <<"keyid=\"">>) of
+                {Pos, _Len} ->
+                    Start = Pos + byte_size(<<"keyid=\"">>),
+                    Rest = binary:part(Bin, Start, byte_size(Bin) - Start),
+                    case binary:match(Rest, <<"\"">>) of
+                        {EndPos, _} -> binary:part(Rest, 0, EndPos);
+                        nomatch -> undefined
+                    end;
+                nomatch ->
+                    undefined
+            end;
+        _ ->
+            undefined
+    end.
+
+operator_address(NodeMsg) ->
+    Default =
+        case hb_opts:get(priv_wallet, no_viable_wallet, NodeMsg) of
+            no_viable_wallet -> undefined;
+            Wallet -> hb_util:id(ar_wallet:to_address(Wallet))
+        end,
+    Operator = hb_opts:get(operator, Default, NodeMsg),
+    case Operator of
+        undefined -> Default;
+        unclaimed -> Default;
+        Val when is_binary(Val) -> Val;
+        Val -> hb_util:bin(Val)
+    end.
+
+keyid_to_operator_address(KeyId) when is_binary(KeyId) ->
+    case KeyId of
+        <<"arweave:", Rest/binary>> -> Rest;
+        <<"publickey:", Rest/binary>> ->
+            try
+                Pub = base64:decode(Rest),
+                hb_util:human_id(crypto:hash(sha256, Pub))
+            catch
+                _:_ -> undefined
+            end;
+        _ ->
+            undefined
+    end;
+keyid_to_operator_address(_) -> undefined.
+
+is_drewfi_operator(ReqMsg, RawRequest, NodeMsg) ->
+    OpAddr = operator_address(NodeMsg),
+    Commitments = maps:get(<<"commitments">>, ReqMsg, maps:get(<<"commitments">>, RawRequest, #{})),
+    HasCommitments = is_map(Commitments) andalso map_size(Commitments) > 0,
+    CommitterMatch =
+        case {OpAddr, HasCommitments} of
+            {undefined, _} -> false;
+            {_, false} -> false;
+            {_, true} ->
+                lists:any(
+                    fun({_Id, C}) ->
+                        case C of
+                            #{ <<"committer">> := Comm } when is_binary(Comm) -> Comm == OpAddr;
+                            _ -> false
+                        end
+                    end,
+                    maps:to_list(Commitments)
+                )
+        end,
+    case CommitterMatch of
+        true -> true;
+        false ->
+            KeyId = extract_signature_keyid(RawRequest),
+            Derived = keyid_to_operator_address(KeyId),
+            Derived =/= undefined andalso OpAddr =/= undefined andalso Derived == OpAddr
+    end.
+
 %% @doc Emits the version number and commit hash of the HyperBEAM node source,
 %% if available.
 %% 
@@ -67,9 +164,8 @@ build(_, _, _NodeMsg) ->
 %% with a `Meta' key are routed to the `handle_meta/2' function, while all
 %% other messages are routed to the `handle_resolve/2' function.
 handle(NodeMsg, RawRequest) ->
-    log_debug(raw_singleton_request, RawRequest),
+    ?event({singleton_tabm_request, RawRequest}),
     NormRequest = hb_singleton:from(RawRequest, NodeMsg),
-    log_debug(normalized_request, NormRequest),
     ?event(
         http,
         {request,
@@ -91,14 +187,159 @@ handle(NodeMsg, RawRequest) ->
                 ),
             Res;
         _ ->
-            log_debug(delegating_to_resolve, #{ raw => RawRequest, norm => NormRequest }),
-            handle_resolve(RawRequest, NormRequest, NodeMsg)
+            Path = try maps:get(<<"path">>, RawRequest) catch _:_ -> undefined end,
+            case Path of
+                <<"/~meta@1.0/drewfi/", _/binary>> ->
+                    handle_drewfi_compute(RawRequest, NormRequest, NodeMsg);
+                _ ->
+                    handle_resolve(RawRequest, NormRequest, NodeMsg)
+            end
     end.
 
-log_debug(Tag, Data) ->
-    Timestamp = erlang:system_time(millisecond),
-    Msg = io_lib:format("[dev_meta] ~p ~p~n", [Timestamp, {Tag, Data}]),
-    file:write_file("/tmp/dev_meta.log", Msg, [append]).
+
+handle_drewfi_compute(RawRequest, NormRequest, NodeMsg) ->
+    Method = try maps:get(<<"method">>, RawRequest) catch _:_ -> <<"GET">> end,
+    Path = try maps:get(<<"path">>, RawRequest) catch _:_ -> <<>> end,
+    {RealPath, RawQS} =
+        case binary:split(Path, <<"?">>) of
+            [P, Q] -> {P, Q};
+            [P] -> {P, <<>>}
+        end,
+    case {Method, RealPath} of
+        {<<"GET">>, <<"/~meta@1.0/drewfi/cache">>} ->
+            Params = uri_string:dissect_query(RawQS),
+            PidOpt = lists:keyfind(<<"pid">>, 1, Params),
+            SlotOpt = lists:keyfind(<<"slot">>, 1, Params),
+            KeyOpt = lists:keyfind(<<"key">>, 1, Params),
+            case {PidOpt, SlotOpt, KeyOpt} of
+                {{_, Pid}, {_, SlotBin}, {_, KeyBin}} ->
+                    Slot = try binary_to_integer(SlotBin) catch _:_ -> 0 end,
+                    % Read the cached computed result for this pid/slot and return
+                    % the requested cache key without triggering scheduler/compute.
+                    case dev_process_cache:read(Pid, Slot, NodeMsg) of
+                        {ok, Msg} ->
+                            KeyPath =
+                                case binary:match(KeyBin, <<"/">>) of
+                                    nomatch -> <<"cache/", KeyBin/binary>>;
+                                    _ -> KeyBin
+                                end,
+                            Value = hb_ao:get(KeyPath, Msg, not_found, NodeMsg),
+                            embed_status(
+                                {ok,
+                                    #{
+                                        <<"status">> => 200,
+                                        <<"pid">> => Pid,
+                                        <<"slot">> => Slot,
+                                        <<"key">> => KeyBin,
+                                        <<"value">> => Value
+                                    }},
+                                NodeMsg
+                            );
+                        _ ->
+                            embed_status(
+                                {not_found,
+                                    #{
+                                        <<"status">> => 404,
+                                        <<"error">> => <<"cache_not_found">>,
+                                        <<"pid">> => Pid,
+                                        <<"slot">> => Slot,
+                                        <<"key">> => KeyBin
+                                    }},
+                                NodeMsg
+                            )
+                    end;
+                _ ->
+                    embed_status(
+                        {error,
+                            #{
+                                <<"status">> => 400,
+                                <<"error">> => <<"missing_pid_slot_or_key">>
+                            }},
+                        NodeMsg
+                    )
+            end;
+        {<<"POST">>, <<"/~meta@1.0/drewfi/compute">>} ->
+            Params = uri_string:dissect_query(RawQS),
+            PidOpt = lists:keyfind(<<"pid">>, 1, Params),
+            SlotOpt = lists:keyfind(<<"slot">>, 1, Params),
+            case {PidOpt, SlotOpt} of
+                {{_, Pid}, {_, SlotBin}} ->
+                    Slot = try binary_to_integer(SlotBin) catch _:_ -> 0 end,                    ReqMsg =
+                        case NormRequest of
+                            [_Base, Req | _] -> Req;
+                            _ -> RawRequest
+                        end,
+                    Verified = hb_message:verify(ReqMsg, all, NodeMsg),
+                    KeyId = extract_signature_keyid(RawRequest),
+                    DerivedAddr = keyid_to_operator_address(KeyId),
+                    OperatorAddr = operator_address(NodeMsg),
+                    Authorized = Verified andalso is_drewfi_operator(ReqMsg, RawRequest, NodeMsg),
+                    ?event(drewfi_crank, {req, {pid, Pid}, {slot, Slot}, {verified, Verified}, {keyid, KeyId}, {keyid_addr, DerivedAddr}, {operator, OperatorAddr}, {authorized, Authorized}}),
+                    case Authorized of
+                        false ->
+                            embed_status(
+                                {forbidden,
+                                    #{
+                                        <<"authorized">> => false,
+                                        <<"verified">> => Verified,
+                                        <<"keyid">> => KeyId,
+                                        <<"keyid_addr">> => DerivedAddr,
+                                        <<"operator">> => OperatorAddr,                                        <<"has_commitments_req">> => maps:is_key(<<"commitments">>, ReqMsg),
+                                        <<"has_commitments_raw">> => maps:is_key(<<"commitments">>, RawRequest),
+                                        <<"has_siginfo_raw">> => (maps:is_key(<<"signature">>, RawRequest) orelse maps:is_key(<<"signature-input">>, RawRequest)),
+                                        <<"codec_device_raw">> => maps:get(<<"codec-device">>, RawRequest, undefined),
+                                        <<"pid">> => Pid,
+                                        <<"slot">> => Slot,
+                                        <<"message">> => <<"unauthorized">>
+                                    }},
+                                NodeMsg
+                            );
+                        true ->
+                            case hb_cache:read(Pid, NodeMsg) of
+                                {ok, ProcessMsg} ->
+                                    StartMs = erlang:monotonic_time(millisecond),
+                                    StartLine = io_lib:format("~p ~p~n", [StartMs, {pid, Pid, slot, Slot, phase, start_sync}]),
+                                    _ = file:write_file("/tmp/drewfi_compute.log", StartLine, [append]),
+                                    ComputeRes = (catch dev_process:compute(ProcessMsg, #{ <<"slot">> => Slot }, NodeMsg)),
+                                    EndMs = erlang:monotonic_time(millisecond),
+                                    Duration = EndMs - StartMs,
+                                    LogLine = io_lib:format("~p ~p~n", [StartMs, {pid, Pid, slot, Slot, ms, Duration, res, ComputeRes}]),
+                                    _ = file:write_file("/tmp/drewfi_compute.log", LogLine, [append]),
+                                    
+                                    case ComputeRes of
+                                        {ok, ResMap} when is_map(ResMap) ->
+                                            embed_status({ok, ResMap}, NodeMsg);
+                                        {error, Err} ->
+                                            embed_status({error, Err}, NodeMsg);
+                                        {'EXIT', Reason} ->
+                                            embed_status({error, #{ <<"status">> => 500, <<"error">> => <<"compute_crash">>, <<"reason">> => hb_util:bin(io_lib:format("~p", [Reason])) }}, NodeMsg);
+                                        Other ->
+                                            embed_status({ok, #{ <<"status">> => 200, <<"result">> => hb_util:bin(io_lib:format("~p", [Other])) }}, NodeMsg)
+                                    end;
+                                _ ->
+                                    embed_status(
+                                        {not_found, #{ <<"error">> => <<"process_not_found">>, <<"pid">> => Pid }},
+                                        NodeMsg
+                                    )
+                            end
+                    end;
+                _ ->
+                    embed_status(
+                        {error, #{ <<"status">> => 400, <<"error">> => <<"missing_pid_or_slot">> }},
+                        NodeMsg
+                    )
+            end;
+        {_, <<"/~meta@1.0/drewfi/compute">>} ->
+            embed_status(
+                {error, #{ <<"status">> => 405, <<"error">> => <<"method_not_allowed">>, <<"method">> => Method }},
+                NodeMsg
+            );
+        _ ->
+            embed_status(
+                {not_found, #{ <<"status">> => 404, <<"error">> => <<"not_found">> }},
+                NodeMsg
+            )
+    end.
 
 handle_initialize([Base = #{ <<"device">> := Dev}, Req = #{ <<"path">> := Path }|_], NodeMsg) ->
     ?event({got, {device, Dev}, {path, Path}}),
@@ -223,7 +464,6 @@ adopt_node_message(Request, NodeMsg) ->
 %% After execution, we run the node's `response' hook on the result of
 %% the request before returning the result it grants back to the user.
 handle_resolve(Req, Msgs, NodeMsg) ->
-    TracePID = hb_opts:get(trace, no_tracer_set, NodeMsg),
     % Apply the pre-processor to the request.
     ?event(http_request,
         {resolve_hook,
@@ -245,7 +485,7 @@ handle_resolve(Req, Msgs, NodeMsg) ->
             Res =
                 hb_ao:resolve_many(
                     PreProcessedMsg,
-                    HTTPOpts#{ force_message => true, trace => TracePID }
+                    HTTPOpts#{ force_message => true }
                 ),
             {ok, StatusEmbeddedRes} = embed_status(Res, NodeMsg),
             AfterResolveOpts = hb_http_server:get_opts(NodeMsg),

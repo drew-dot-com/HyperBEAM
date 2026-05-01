@@ -331,13 +331,22 @@ call_function(X, Function, Args) ->
     Result.
 -else.
 call_function(X, Function, Args) ->
-    do_call_function(X, Function, Args).
+    case is_write_like(Function) of
+        true -> do_call_function_replicate(X, Function, Args);
+        false -> do_call_function(X, Function, Args)
+    end.
 -endif.
-do_call_function(X, _Function, _Args) when not is_list(X) ->
-    do_call_function([X], _Function, _Args);
+do_call_function(X, Function, Args) when not is_list(X) ->
+    do_call_function([X], Function, Args);
 do_call_function([], _Function, _Args) ->
     not_found;
-do_call_function([Store = #{<<"access">> := Access} | Rest], Function, Args) ->
+do_call_function(StoreList, Function, Args) when is_list(StoreList) ->
+    maybe_log_store_call(StoreList, Function, Args),
+    do_call_function_list(StoreList, Function, Args).
+
+do_call_function_list([], _Function, _Args) ->
+    not_found;
+do_call_function_list([Store = #{<<"access">> := Access} | Rest], Function, Args) ->
     % If the store has an access controls, check if the function is allowed from
     % the stated policies.
     IsAdmissible =
@@ -352,23 +361,107 @@ do_call_function([Store = #{<<"access">> := Access} | Rest], Function, Args) ->
         ),
     case IsAdmissible of
         true ->
-            do_call_function(
+            do_call_function_list(
                 [maps:remove(<<"access">>, Store) | Rest],
                 Function,
                 Args
             );
         false ->
-            do_call_function(Rest, Function, Args)
+            do_call_function_list(Rest, Function, Args)
     end;
-do_call_function([Store = #{<<"store-module">> := Mod} | Rest], Function, Args) ->
+do_call_function_list([Store = #{<<"store-module">> := Mod} | Rest], Function, Args) ->
     % Attempt to apply the function. If it fails, try the next store.
     try apply_store_function(Mod, Store, Function, Args) of
         not_found ->
-            do_call_function(Rest, Function, Args);
+            do_call_function_list(Rest, Function, Args);
         Result ->
             Result
-    catch _:_:_ -> do_call_function(Rest, Function, Args)
+    catch _:_:_ -> do_call_function_list(Rest, Function, Args)
     end.
+
+maybe_log_store_call(StoreList, Function, Args)
+        when Function == make_group; Function == write ->
+    log_store_call(Function, StoreList, Args);
+maybe_log_store_call(_StoreList, _Function, _Args) ->
+    ok.
+
+log_store_call(Function, StoreList, Args) ->
+    {PathInfo, ValueSize} = store_call_metadata(Args),
+    ?event(store_debug,
+        {store_call,
+            {function, Function},
+            {stores, StoreList},
+            {path, PathInfo},
+            {hashpath, hb_opts:get(hashpath, undefined)},
+            {value_size, ValueSize}
+        }).
+
+store_call_metadata([Path, Value | _]) when is_binary(Value) ->
+    {Path, {bytes, byte_size(Value)}};
+store_call_metadata([Path, Value | _]) when is_list(Value) ->
+    {Path, {list_length, length(Value)}};
+store_call_metadata([Path | _]) ->
+    {Path, undefined};
+store_call_metadata(_) ->
+    {undefined, undefined}.
+
+is_write_like(write) -> true;
+is_write_like(make_group) -> true;
+is_write_like(make_link) -> true;
+is_write_like(_) -> false.
+
+%% @doc For write-like functions, attempt all stores instead of short-circuiting
+%% on first success. Returns the first successful result (if any), otherwise
+%% not_found. Errors in later stores do not prevent earlier successes.
+do_call_function_replicate(X, Function, Args) when not is_list(X) ->
+    do_call_function_replicate([X], Function, Args);
+do_call_function_replicate([], _Function, _Args) ->
+    not_found;
+do_call_function_replicate(StoreList, Function, Args) ->
+    maybe_log_store_call(StoreList, Function, Args),
+    {Result, _Errors} =
+        lists:foldl(
+            fun(Store, {Success, Errors}) ->
+                case maybe_apply_store(Function, Args, Store) of
+                    {ok, Res} ->
+                        {case Success of undefined -> {ok, Res}; _ -> Success end, Errors};
+                    ok ->
+                        {case Success of undefined -> ok; _ -> Success end, Errors};
+                    not_found ->
+                        {Success, [not_found | Errors]};
+                    Other ->
+                        {Success, [Other | Errors]}
+                end
+            end,
+            {undefined, []},
+            StoreList
+        ),
+    case Result of
+        undefined -> not_found;
+        _ -> Result
+    end.
+
+maybe_apply_store(Function, Args, Store = #{<<"access">> := Access}) ->
+    IsAdmissible =
+        lists:any(
+            fun(Group) ->
+                lists:any(
+                    fun(F) -> F == Function end,
+                    maps:get(Group, ?STORE_ACCESS_POLICIES, [])
+                )
+            end,
+            Access
+        ),
+    case IsAdmissible of
+        true -> maybe_apply_store(Function, Args, maps:remove(<<"access">>, Store));
+        false -> not_found
+    end;
+maybe_apply_store(Function, Args, Store = #{<<"store-module">> := Mod}) ->
+    try apply_store_function(Mod, Store, Function, Args) of
+        Result -> Result
+    catch _:_:_ -> not_found end;
+maybe_apply_store(_Function, _Args, _Store) ->
+    not_found.
 
 %% @doc Apply a store function, checking if the store returns a retry request or
 %% errors. If it does, attempt to start the store again and retry, up to the

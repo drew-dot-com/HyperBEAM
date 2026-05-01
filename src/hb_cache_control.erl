@@ -24,8 +24,9 @@
 maybe_store(Msg1, Msg2, Msg3, Opts) ->
     case derive_cache_settings([Msg3, Msg2], Opts) of
         #{ <<"store">> := true } ->
+            FixedOpts = ensure_hashpath_update(Opts),
             ?event(caching, {caching_result, {msg1, Msg1}, {msg2, Msg2}, {msg3, Msg3}}),
-            dispatch_cache_write(Msg1, Msg2, Msg3, Opts);
+            dispatch_cache_write(Msg1, Msg2, Msg3, FixedOpts);
         _ -> 
             not_caching
     end.
@@ -220,6 +221,11 @@ derive_cache_settings(SourceList, Opts) ->
         #{ <<"store">> => ?DEFAULT_STORE_OPT, <<"lookup">> => ?DEFAULT_LOOKUP_OPT },
         [{opts, Opts}|lists:filter(fun erlang:is_map/1, SourceList)]
     ).
+
+ensure_hashpath_update(Opts) when is_map(Opts) ->
+    Opts#{ hashpath => update };
+ensure_hashpath_update(Opts) ->
+    Opts.
 
 %% @doc Takes a key and two maps, returning the first map with the key set to
 %% the value of the second map _if_ the value is not undefined.

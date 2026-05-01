@@ -28,26 +28,35 @@
 -include_lib("include/hb.hrl").
 
 %% @doc Necessary hooks for compliance with the `execution-device' standard.
-init(Msg1, _Msg2, _Opts) -> {ok, Msg1}.
-normalize(Msg1, _Msg2, _Opts) -> {ok, Msg1}.
-snapshot(Msg1, _Msg2, _Opts) -> {ok, Msg1}.
-compute(Msg1, Msg2, Opts) -> patches(Msg1, Msg2, Opts).
+init(Base, _Req, _Opts) -> {ok, Base}.
+normalize(Base, _Req, _Opts) -> {ok, Base}.
+snapshot(Base, _Req, _Opts) -> {ok, Base}.
+compute(Base, Req, Opts) -> patches(Base, Req, Opts).
 
 %% @doc Get the value found at the `patch-from' key of the message, or the
 %% `from' key if the former is not present. Remove it from the message and set
 %% the new source to the value found.
-all(Msg1, Msg2, Opts) ->
-    move(all, Msg1, Msg2, Opts).
+all(Base, Req, Opts) ->
+    move(all, Base, Req, Opts).
 
 %% @doc Find relevant `PATCH' messages in the given source key of the execution
 %% and request messages, and apply them to the given destination key of the
 %% request.
-patches(Msg1, Msg2, Opts) ->
-    move(patches, Msg1, Msg2, Opts).
+patches(Base, Req, Opts) ->
+    move(patches, Base, Req, Opts).
 
 %% @doc Unified executor for the `all' and `patches' modes.
-move(Mode, Msg1, Msg2, Opts) ->
-    maybe
+move(Mode, Base, Req, Opts) ->
+    try
+        _ = file:write_file(
+            "/tmp/dev_patch.log",
+            io_lib:format(
+                "~p move_start mode=~p~n",
+                [erlang:monotonic_time(millisecond), Mode]
+            ),
+            [append]
+        ),
+        maybe
         % Find the input paths.
         % For `from' we parse the path to see if it is relative to the request
         % or the base message. This is not needed for `to' because it is
@@ -55,10 +64,10 @@ move(Mode, Msg1, Msg2, Opts) ->
         RawPatchFrom =
             hb_ao:get_first(
                 [
-                    {Msg2, <<"patch-from">>},
-                    {Msg1, <<"patch-from">>},
-                    {Msg2, <<"from">>},
-                    {Msg1, <<"from">>}
+                    {Req, <<"patch-from">>},
+                    {Base, <<"patch-from">>},
+                    {Req, <<"from">>},
+                    {Base, <<"from">>}
                 ],
                 <<"/">>,
                 Opts
@@ -68,14 +77,14 @@ move(Mode, Msg1, Msg2, Opts) ->
                 [BinKey|RestKeys] ->
                     case binary:split(BinKey, <<":">>) of
                         [<<"base">>, RestKey] ->
-                            {Msg1, [RestKey|RestKeys]};
+                            {Base, [RestKey|RestKeys]};
                         [<<"req">>, RestKey] ->
-                            {Msg2, [RestKey|RestKeys]};
+                            {Req, [RestKey|RestKeys]};
                         _ ->
-                            {Msg1, RawPatchFrom}
+                            {Base, RawPatchFrom}
                     end;
                 _ ->
-                    {Msg1, RawPatchFrom}
+                    {Base, RawPatchFrom}
             end,
         ?event({patch_from_parts, {explicit, PatchFromParts}}),
         PatchFrom =
@@ -87,10 +96,10 @@ move(Mode, Msg1, Msg2, Opts) ->
         PatchTo =
             hb_ao:get_first(
                 [
-                    {Msg2, <<"patch-to">>},
-                    {Msg1, <<"patch-to">>},
-                    {Msg2, <<"to">>},
-                    {Msg1, <<"to">>}
+                    {Req, <<"patch-to">>},
+                    {Base, <<"patch-to">>},
+                    {Req, <<"to">>},
+                    {Base, <<"to">>}
                 ],
                 <<"/">>,
                 Opts
@@ -183,6 +192,18 @@ move(Mode, Msg1, Msg2, Opts) ->
         % Return the patched message and the source, less the patches.
         ?event({patch_result, PatchedResult}),
         {ok, PatchedResult}
+        end
+    catch
+        Class:Reason:Stack ->
+            _ = file:write_file(
+                "/tmp/dev_patch_error.log",
+                io_lib:format(
+                    "~p patch_error mode=~p class=~p reason=~p stack=~p~n",
+                    [erlang:monotonic_time(millisecond), Mode, Class, Reason, Stack]
+                ),
+                [append]
+            ),
+            erlang:raise(Class, Reason, Stack)
     end.
 
 %%% Tests

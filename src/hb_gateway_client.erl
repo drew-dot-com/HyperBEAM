@@ -241,8 +241,8 @@ result_to_message(ExpectedID, Item, Opts) ->
     % We have the headers, so we can get the data.
     Data =
         case hb_maps:get(<<"data">>, Item, not_found, GQLOpts) of
+            #{ <<"size">> := Zero } when Zero =:= <<"0">> orelse Zero =:= 0 -> <<>>;
             BinData when is_binary(BinData) -> BinData;
-            #{ <<"size">> := 0 } -> <<>>;
             _ ->
                 {ok, Bytes} = data(ExpectedID, Opts),
                 Bytes
@@ -262,7 +262,7 @@ result_to_message(ExpectedID, Item, Opts) ->
             _ -> unsupported_tx_signature_type
         end,
     TX =
-        ar_bundles:reset_ids(#tx {
+        dev_arweave_common:reset_ids(#tx {
             format = ans104,
             anchor =
                 normalize_null(hb_maps:get(<<"anchor">>, Item, not_found, GQLOpts)),

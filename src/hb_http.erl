@@ -153,7 +153,7 @@ request(Method, Peer, Path, RawMessage, Opts) ->
     % Merge the set-cookie message into the header map, which itself is
     % constructed from the header key-value pair list.
     HeaderMap = hb_maps:merge(hb_maps:from_list(Headers), MaybeSetCookie, Opts),
-    NormHeaderMap = normalize_keys_safe(HeaderMap, Opts),
+    NormHeaderMap = hb_ao:normalize_keys(HeaderMap, Opts),
     ?event(http_outbound,
         {normalized_response_headers, {norm_header_map, NormHeaderMap}},
         Opts
@@ -343,7 +343,7 @@ route_to_request(M, {error, Reason}, _Opts) ->
 %% preferred format. This function honors the `accept-bundle' option, if it is
 %% already present in the message, and sets it to `true' if it is not.
 prepare_request(Format, Method, Peer, Path, RawMessage, Opts) ->
-    Message = normalize_keys_safe(RawMessage, Opts),
+    Message = hb_ao:normalize_keys(RawMessage, Opts),
     % Generate a `cookie' key for the message, if an unencoded cookie is
     % present.
     {MaybeCookie, WithoutCookie} =
@@ -468,7 +468,7 @@ reply(Req, TABMReq, Message, Opts) ->
 reply(Req, TABMReq, BinStatus, RawMessage, Opts) when is_binary(BinStatus) ->
     reply(Req, TABMReq, binary_to_integer(BinStatus), RawMessage, Opts);
 reply(InitReq, TABMReq, Status, RawMessage, Opts) ->
-    KeyNormMessage = normalize_keys_safe(RawMessage, Opts),
+    KeyNormMessage = hb_ao:normalize_keys(RawMessage, Opts),
     {ok, Req, Message} = reply_handle_cookies(InitReq, KeyNormMessage, Opts),
     {ok, HeadersBeforeCors, EncodedBody} =
         encode_reply(
@@ -515,8 +515,60 @@ reply(InitReq, TABMReq, Status, RawMessage, Opts) ->
 %% @doc Handle replying with cookies if the message contains them. Returns the
 %% new Cowboy `Req` object, and the message with the cookies removed. Both
 %% `set-cookie' and `cookie' fields are treated as viable sources of cookies.
-reply_handle_cookies(Req, Message, _Opts) ->
-    {ok, Req, Message}.
+reply_handle_cookies(Req, Message, Opts) ->
+    CookiesRes =
+        try
+            dev_codec_cookie:extract(Message, #{}, Opts)
+        catch
+            throw:Reason ->
+                ?event(debug_cookie, {cookie_extract_threw, {explicit, Reason}}),
+                {ok, #{}};
+            error:Reason ->
+                ?event(debug_cookie, {cookie_extract_errored, {explicit, Reason}}),
+                {ok, #{}}
+        end,
+    {ok, Cookies} = CookiesRes,
+    ?event(debug_cookie, {encoding_reply_cookies, {explicit, Cookies}}),
+    case Cookies of
+        NoCookies when map_size(NoCookies) == 0 -> {ok, Req, Message};
+        _ ->
+            % The internal values of the `cookie' field will be stored in the
+            % `priv_store' by default, so we let `dev_codec_cookie:opts/1'
+            % reset the options.
+            {ok, #{ <<"set-cookie">> := SetCookieLines }} =
+                dev_codec_cookie:to(
+                    Message,
+                    #{ <<"format">> => <<"set-cookie">> },
+                    Opts
+                ),
+            ?event(debug_cookie, {outbound_set_cookie_lines, SetCookieLines}),
+            % Add the cookies to the response headers.
+            FinalReq =
+                lists:foldl(
+                    fun(FullCookieLine, ReqAcc) ->
+                        [CookieRef, _] = binary:split(FullCookieLine, <<"=">>),
+                        RespCookies = maps:get(resp_cookies, ReqAcc, #{}),
+                        % Note: Cowboy handles cookies peculiarly. The key
+                        % given in the `resp_cookies' map is not used directly
+                        % in the response headers. Nonetheless, we use the
+                        % key parsed from the cookie line as the key, but do not
+                        % be surprised if while debugging you see a different
+                        % key created by Cowboy in the response headers.
+                        ReqAcc#{
+                            resp_cookies =>
+                                RespCookies#{ CookieRef => FullCookieLine }
+                        }
+                    end,
+                    Req,
+                    SetCookieLines
+                ),
+            {ok, CookieReset} = dev_codec_cookie:reset(Message, Opts),
+            {
+                ok,
+                FinalReq,
+                CookieReset
+            }
+    end.
 
 %% @doc Add permissive CORS headers to a message, if the message has not already
 %% specified CORS headers.
@@ -657,6 +709,14 @@ encode_reply(Status, TABMReq, Message, Opts) ->
             % the message to the codec. We also include all of the top-level 
             % fields, except for maps and lists, in the message and return them 
             % as headers.
+            %
+            % IMPORTANT: Header values must be kept small. Some error paths
+            % (notably 500 responses) can include extremely large `details`
+            % payloads that will break standard HTTP clients (curl, undici)
+            % due to max header size limits. We therefore:
+            % - never expose `details`/`stacktrace` as headers (body only)
+            % - cap all other header values to a conservative size
+            MaxHeaderValueBytes = hb_opts:get(max_header_value_bytes, 16384, Opts),
             ExtraHdrs =
                 hb_maps:filter(
                     fun(Key, V) ->
@@ -664,15 +724,24 @@ encode_reply(Status, TABMReq, Message, Opts) ->
                             andalso not is_list(V)
                             andalso Key =/= <<"body">>
                             andalso Key =/= <<"data">>
+                            andalso Key =/= <<"details">>
+                            andalso Key =/= <<"stacktrace">>
                     end,
                     Message,
                     Opts
                 ),
             % Encode all header values as strings.
-            EncodedExtraHdrs =
+            EncodedExtraHdrs0 =
                 maps:map(
                     fun(_K, V) -> hb_util:bin(V) end,
                     ExtraHdrs
+                ),
+            EncodedExtraHdrs =
+                maps:filter(
+                    fun(_K, V) ->
+                        is_binary(V) andalso byte_size(V) =< MaxHeaderValueBytes
+                    end,
+                    EncodedExtraHdrs0
                 ),
             {ok,
                 hb_maps:merge(EncodedExtraHdrs, BaseHdrs, Opts),
@@ -770,59 +839,9 @@ req_to_tabm_singleton(Req, Body, Opts) ->
             "?",
             (cowboy_req:qs(Req))/binary
         >>,
-    Method = cowboy_req:method(Req),
-    BodySize = byte_size(Body),
-    PreviewLen = erlang:min(512, BodySize),
-    Preview = base64:encode_to_string(binary:part(Body, 0, PreviewLen)),
     Headers = cowboy_req:headers(Req),
-    error_logger:warning_msg(
-        "[hb_http] incoming method=~p path=~p body_bytes=~p header_keys=~p preview_b64=~s~n",
-        [Method, FullPath, BodySize, maps:keys(Headers), Preview]
-    ),
-    ?event(http,
-        {incoming_request_preview,
-            {method, Method},
-            {path, FullPath},
-            {body_bytes, BodySize},
-            {header_keys, maps:keys(Headers)},
-            {body_preview_base64, Preview}
-        }
-    ),
     {ok, _Path, QueryKeys} = hb_singleton:from_path(FullPath),
     PrimitiveMsg = maps:merge(Headers, QueryKeys),
-    io:format("[hb_http] primitive_message=~p~n", [PrimitiveMsg]),
-    try
-        LogEntry =
-            #{
-                timestamp => erlang:system_time(millisecond),
-                method => cowboy_req:method(Req),
-                path => FullPath,
-                body_bytes => byte_size(Body),
-                header_keys => maps:keys(Headers),
-                query_keys => maps:keys(QueryKeys),
-                body_preview =>
-                    base64:encode_to_string(
-                        binary:part(
-                            Body,
-                            0,
-                            erlang:min(256, byte_size(Body))
-                        )
-                    )
-            },
-        case file:write_file(
-            "/tmp/hb_http_req.log",
-            io_lib:format("~p~n", [LogEntry]),
-            [append]
-        ) of
-            ok -> ok;
-            {error, Reason} ->
-                io:format("[hb_http] log_write_error=~p~n", [Reason])
-        end
-    catch
-        Class:CatchReason:Stacktrace ->
-            io:format("[hb_http] log_exception class=~p reason=~p stack=~p~n",
-                [Class, CatchReason, Stacktrace])
-    end,
     Codec =
         case hb_maps:find(<<"codec-device">>, PrimitiveMsg, Opts) of
             {ok, ExplicitCodec} -> ExplicitCodec;
@@ -1024,7 +1043,7 @@ normalize_unsigned(PrimMsg, Req = #{ headers := RawHeaders }, Msg, Opts) ->
             <<"">> -> hb_message:without_unless_signed(<<"body">>, WithCookie, Opts);
             _ -> WithCookie
         end,
-    case hb_maps:get(<<"ao-peer-port">>, NormalBody, undefined, Opts) of
+    WithPeer = case hb_maps:get(<<"ao-peer-port">>, NormalBody, undefined, Opts) of
         undefined -> NormalBody;
         P2PPort ->
             % Calculate the peer address from the request. We honor the 
@@ -1045,6 +1064,11 @@ normalize_unsigned(PrimMsg, Req = #{ headers := RawHeaders }, Msg, Opts) ->
             (hb_message:without_unless_signed(<<"ao-peer-port">>, NormalBody, Opts))#{
                 <<"ao-peer">> => Peer
             }
+    end,
+    % Add device from PrimMsg if present
+    case maps:get(<<"device">>, PrimMsg, not_found) of
+        not_found -> WithPeer;
+        Device -> WithPeer#{<<"device">> => Device}
     end.
 
 %%% Tests
@@ -1231,9 +1255,3 @@ index_request_test() ->
             #{}
         ),
     ?assertEqual(<<"i like dogs!">>, hb_ao:get(<<"body">>, Res, #{})).
-
-normalize_keys_safe(Message, Opts) ->
-    case erlang:function_exported(hb_ao, normalize_keys, 2) of
-        true -> hb_ao:normalize_keys(Message, Opts);
-        false -> hb_ao:normalize_keys(Message)
-    end.
